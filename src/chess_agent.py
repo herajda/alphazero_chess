@@ -389,12 +389,10 @@ def main(args: argparse.Namespace) -> Player:
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(args.threads)
 
-    if args.recodex:
-        # Load the trained agent
+    if args.infer:
         args.num_simulations = 100 
         agent = Agent.load(args.model_path, args)
     else:
-        # Perform training
         agent = train(args)
 
     return Player(agent, args)
