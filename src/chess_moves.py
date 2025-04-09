@@ -64,12 +64,7 @@ def move_to_action(board, move):
     return None  # Not one of the 73 move types
 
 def legal_moves_to_array(board):
-    """Create a [8, 8, 73] boolean array of legal moves."""
-    array = np.zeros((8, 8, 73), dtype=bool)
-    for move in board.legal_moves:
-        action = move_to_action(board, move)
-        if action:
-            array[action] = True
+    array = [uci_to_action(board, move.uci()) for move in board.legal_moves]
     return array
 
 def uci_to_action(board, uci):
@@ -224,7 +219,6 @@ def board_to_tensor(board):
     
     # Get history and repetition counts
     history, counts = get_history_and_counts(board, max_history=8)
-    print(history)
     
     # Initialize the tensor
     tensor = np.zeros((8, 8, 119), dtype=np.float32)
@@ -249,7 +243,6 @@ def board_to_tensor(board):
                     else:
                         # P2's pieces: planes 6-11
                         plane_index = 6 + piece_type
-                    print(f"i={i}, j={j}, k={t*14+plane_index}, plane_index={piece_type}, t={t}")
                     tensor[i, j, t * 14 + plane_index] = 1
         # Repetition planes
         count = counts[t]

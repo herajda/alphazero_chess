@@ -2,6 +2,7 @@ import argparse
 import collections
 import os
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", default=None, type=int, help="Random seed.")
 parser.add_argument("--threads", default=1, type=int, help="Maximum number of threads to use.")
-parser.add_argument("--processes", default=20, type=int, help="Maximum number of threads for generation to use.")
+parser.add_argument("--processes", default=6, type=int, help="Maximum number of threads for generation to use.")
 parser.add_argument("--alpha", default=0.3, type=float, help="MCTS root Dirichlet alpha")
 parser.add_argument("--batch_size", default=64, type=int, help="Number of game positions to train on.")
 parser.add_argument("--epsilon", default=0.25, type=float, help="MCTS exploration epsilon in root")
@@ -30,8 +31,7 @@ parser.add_argument("--train_for", default=100, type=int, help="Update steps in 
 parser.add_argument("--window_length", default=100_000, type=int, help="Replay buffer max length.")
 parser.add_argument("--final_learning_rate", default=0.0001, type=float, help="Final minimum learning rate.")
 parser.add_argument("--total_decay_iterations", default=100, type=int, help="Total iterations over which the learning rate will decay linearly.")
-parser.add_argument("--board_size", default=7, type=int, help="Board size.")
-parser.add_argument("--num_actions", default=28, type=int, help="Number of actions.")
+parser.add_argument("--infer", default=False, type=bool, help="Inference mode ON or OFF.")
 
 class ReplayBuffer:
     """Simple replay buffer with possibly limited capacity."""
@@ -83,80 +83,97 @@ def adjust_learning_rate(optimizer, iteration, args):
         param_group['lr'] = lr
 
 class Agent:
-    # Use GPU if available.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def __init__(self, args: argparse.Namespace):
-        # define residual block 
-        class ResidualBlock(nn.Module):
-            def __init__(self, in_channels, out_channels, stride=1):
-                super(ResidualBlock, self).__init__()
-                self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-                self.bn1 = nn.BatchNorm2d(out_channels)
-                self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-                self.bn2 = nn.BatchNorm2d(out_channels)
-        
-                self.shortcut = nn.Sequential()
-                if stride != 1 or in_channels != out_channels:
-                    self.shortcut = nn.Sequential(
-                        nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                        nn.BatchNorm2d(out_channels)
-                    )
-        
-            def forward(self, x):
-                out = F.relu(self.bn1(self.conv1(x)))
-                out = self.bn2(self.conv2(out))
-                out += self.shortcut(x)
-                out = F.relu(out)
-                return out
-        
-        class Model(nn.Module):
+    def __init__(self, args):
+        class TransformerModel(nn.Module):
             def __init__(self, args):
-                super(Model, self).__init__()
-                self.initial_channels = 119  # The number of input channels
-                self.num_channels = 512     # The number of channels in each ResidualBlock
-        
-                # The first block will adapt from the initial input channel size to the model's channel size
-                self.layer1 = ResidualBlock(self.initial_channels, self.num_channels)
-                # Subsequent layers maintain the channel size
-                self.layer2 = ResidualBlock(self.num_channels, self.num_channels)
-                self.layer3 = ResidualBlock(self.num_channels, self.num_channels)
-                self.layer4 = ResidualBlock(self.num_channels, self.num_channels)
-                self.layer5 = ResidualBlock(self.num_channels, self.num_channels)
-        
-                self.conv_policy_head = nn.Conv2d(self.num_channels, 2, kernel_size=3, padding=1)
-                self.flatten_policy = nn.Flatten()
-                self.dense_policy = nn.Linear(2 * args.board_size * args.board_size, args.num_actions)  
-        
-                self.conv_value_head = nn.Conv2d(self.num_channels, 1, kernel_size=3, padding=1)
-                self.flatten_value = nn.Flatten()
-                self.dense_value = nn.Linear(args.board_size * args.board_size, 1)  
-        
+                super(TransformerModel, self).__init__()
+                self.board_size = ChessGame.N  # 8
+                self.initial_channels = 119
+                self.dim_model = 512  # Similar to num_channels in original
+                self.num_actions = ChessGame.ACTIONS
+                self.num_layers = 6
+                self.num_heads = 8
+                
+                # Input projection
+                self.input_proj = nn.Conv2d(self.initial_channels, self.dim_model, kernel_size=1)
+                
+                # Positional encoding
+                self.pos_encoding = self.create_positional_encoding()
+                
+                # Transformer layers
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=self.dim_model,
+                    nhead=self.num_heads,
+                    dim_feedforward=self.dim_model*4,
+                    dropout=0.1,
+                    batch_first=True
+                )
+                self.transformer = nn.TransformerEncoder(
+                    encoder_layer,
+                    num_layers= self.num_layers  # Same number of layers as residual blocks
+                )
+                
+                # Policy head
+                self.policy_conv = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
+                self.policy_flatten = nn.Flatten()
+                self.policy_dense = nn.Linear(2 * self.board_size * self.board_size, self.num_actions)
+                
+                # Value head
+                self.value_conv = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
+                self.value_flatten = nn.Flatten()
+                self.value_dense = nn.Linear(self.board_size * self.board_size, 1)
+                
+            def create_positional_encoding(self):
+                position = torch.arange(self.board_size * self.board_size).unsqueeze(1).float()
+                div_term = torch.exp(torch.arange(0, self.dim_model, 2).float() * (-math.log(10000.0) / self.dim_model))
+                
+                pe = torch.zeros(self.board_size * self.board_size, self.dim_model)
+                pe[:, 0::2] = torch.sin(position * div_term)
+                pe[:, 1::2] = torch.cos(position * div_term)
+                return pe.unsqueeze(0)  # [1, board_size*board_size, dim_model]
+            
             def forward(self, x):
-                x = x.permute(0, 3, 1, 2)  
-        
-                x = self.layer1(x)
-                x = self.layer2(x)
-                x = self.layer3(x)
-                x = self.layer4(x)
-                x = self.layer5(x)
-        
-                policy_x = self.conv_policy_head(x)
-                policy_x = self.flatten_policy(policy_x)
-                policy = F.softmax(self.dense_policy(policy_x), dim=-1)
-        
-                value_x = self.conv_value_head(x)
-                value_x = self.flatten_value(value_x)
-                value = torch.tanh(self.dense_value(value_x))
-        
+                # Input shape: [batch_size, board_size, board_size, channels]
+                batch_size = x.size(0)
+                
+                # Move channels to second dimension
+                x = x.permute(0, 3, 1, 2)  # [batch_size, channels, board_size, board_size]
+                
+                # Project to model dimension
+                x = self.input_proj(x)  # [batch_size, dim_model, board_size, board_size]
+                
+                # Reshape for transformer
+                x = x.flatten(2).transpose(1, 2)  # [batch_size, board_size*board_size, dim_model]
+                
+                # Add positional encoding
+                pos_encoding = self.pos_encoding.to(x.device)
+                x = x + pos_encoding
+                
+                # Transformer encoding
+                x = self.transformer(x)  # [batch_size, board_size*board_size, dim_model]
+                
+                # Reshape back to 2D for conv heads
+                x = x.transpose(1, 2).reshape(batch_size, self.dim_model, self.board_size, self.board_size)
+                
+                # Policy head
+                policy_x = self.policy_conv(x)
+                policy_x = self.policy_flatten(policy_x)
+                policy = F.softmax(self.policy_dense(policy_x), dim=-1)
+                
+                # Value head
+                value_x = self.value_conv(x)
+                value_x = self.value_flatten(value_x)
+                value = torch.tanh(self.value_dense(value_x))
+                
                 return policy, value
 
-        self._model = Model(args)
+        self._model = TransformerModel(args).to(self.device)
         self.optimizer = torch.optim.AdamW(self._model.parameters(), lr=args.learning_rate)
 
     @classmethod
-    def load(cls, path: str, args: argparse.Namespace) -> "Agent":
-        # A static method returning a new Agent loaded from the given path.
+    def load(cls, path: str, args) -> "Agent":
         agent = Agent(args)
         agent._model.load_state_dict(torch.load(path, map_location=agent.device))
         return agent
@@ -165,23 +182,29 @@ class Agent:
         torch.save(self._model.state_dict(), path)
 
     def train(self, boards: torch.Tensor, target_policies: torch.Tensor, target_values: torch.Tensor) -> None:
-        # TODO: wrap the parameters to torch tensors
+        boards = boards.to(self.device)
+        target_policies = target_policies.to(self.device)
+        target_values = target_values.to(self.device)
+        
         policy, value = self._model(boards)
         value = value.squeeze(-1)
-        loss = torch.nn.functional.cross_entropy(policy, target_policies) + torch.nn.functional.mse_loss(value, target_values)
+        
+        loss = (F.cross_entropy(policy, target_policies) + 
+                F.mse_loss(value, target_values))
+        
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-    def predict(self, boards: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
-        # Return the predicted policy and the value function.
-        policy, value = self._model(boards)
+    def predict(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        boards = boards.to(self.device)
+        with torch.no_grad():
+            policy, value = self._model(boards)
         return policy.detach().cpu().numpy(), value.detach().cpu().numpy()
 
-    def board(self, game: ChessGame) -> np.ndarray:
-        # keep the current player the same all the time
-        if game.to_play != 0:
-            game = game.clone(swap_players=True)
+    def board(self, game) -> torch.Tensor:
+        #if game.to_play != 0:
+        #    game = game.clone(swap_players=True)
         return game.board
 
 
@@ -233,7 +256,7 @@ class MCTNode:
                 value = -1
 
         else:
-            agent_board = agent.board(self.game)[np.newaxis]
+            agent_board = torch.from_numpy(agent.board(self.game)[np.newaxis])
 
             policy, _ = agent.predict(agent_board)
             policy = policy[0]
@@ -294,6 +317,7 @@ def mcts(game: ChessGame, agent: Agent, args: argparse.Namespace, explore: bool)
             game = node.game
             if node.is_evaluated():
                 action, node = node.select_child()
+
                 path.append((node, action))
             else:
                 break
@@ -306,6 +330,7 @@ def mcts(game: ChessGame, agent: Agent, args: argparse.Namespace, explore: bool)
             else:
                 game = game.clone()
                 game.move(action)
+
                 node.evaluate(game, agent)
 
         else:
@@ -340,6 +365,7 @@ def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
     moves = 0
 
     while game.winner is None:
+        print(moves)
         policy = mcts(game, agent, args, explore=True)
 
         mask = np.zeros(game.ACTIONS, dtype=bool)
@@ -376,6 +402,7 @@ def train(args: argparse.Namespace) -> Agent:
     while training:
         iteration += 1
 
+        print(f"Iteration {iteration}:")
         # Generate simulated games
         with Pool(processes=args.processes) as pool:
             games = pool.map(simulate_single_game, [args] * args.sim_games)
@@ -416,7 +443,7 @@ class Player:
         # Predict a best possible action.
         if self.args.num_simulations == 0:
             # If no simulations should be performed, use directly the policy predicted by the agent on the current game board.
-            agent_board = self.agent.board(game)[np.newaxis]
+            agent_board = torch.from_numpy(self.agent.board(game)[np.newaxis])
             policy, _ = self.agent.predict(agent_board)
             policy = policy[0]
         else:

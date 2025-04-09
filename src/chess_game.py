@@ -79,12 +79,11 @@ class ChessGame(BoardGame):
         return chess_moves.legal_moves_to_array(self._board)
 
     def move(self, action):
-        move = chess.Move.from_uci(action)
+        move = chess.Move.from_uci(chess_moves.action_to_uci(self._board, action))
         if move not in self._board.legal_moves:
             raise ValueError(f"Invalid move: {action}")
         self._board.push(move)
 
     def to_play(self):
         return int(self._board.turn)
-
 
