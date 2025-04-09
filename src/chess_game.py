@@ -19,10 +19,6 @@ class BoardGame:
         """Return the board as a NxNxC numpy array of features."""
 
     @property
-    def board_internal(self):
-        """Return the internal representation of board as a NxN numpy array."""
-
-    @property
     def to_play(self):
         """Return the current player."""
 
@@ -41,10 +37,13 @@ class BoardGame:
 
 class ChessGame(BoardGame):
     ACTIONS = 4672 #8x8x73
+    N = 8
+    # {king, queen, rook, bishop, knight, pawn, empty} x {white and black}
+    C = 119 
+    
 
     def __init__(self):
         self._board = chess.Board()
-        self._winner = None
 
     def clone(self, swap_players=False):
         clone = ChessGame()
@@ -55,11 +54,7 @@ class ChessGame(BoardGame):
 
     @property
     def board(self):
-        return self._get_board_features()
-
-    @property
-    def board_internal(self):
-        return np.array(self._board.piece_map().values())
+        return chess_moves.board_to_tensor(self._board) 
 
     @property
     def to_play(self):
@@ -81,11 +76,15 @@ class ChessGame(BoardGame):
 
     def valid_actions(self):
         """Return the list of valid actions."""
-        return chess_moves.get_legal_moves(self._board)
+        return chess_moves.legal_moves_to_array(self._board)
 
     def move(self, action):
         move = chess.Move.from_uci(action)
         if move not in self._board.legal_moves:
             raise ValueError(f"Invalid move: {action}")
         self._board.push(move)
+
+    def to_play(self):
+        return int(self._board.turn)
+
 
