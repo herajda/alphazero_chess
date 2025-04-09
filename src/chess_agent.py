@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from multiprocessing import Pool
+from chess_game import ChessGame  
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -112,8 +113,8 @@ class Agent:
         class Model(nn.Module):
             def __init__(self, args):
                 super(Model, self).__init__()
-                self.initial_channels = 4  # The number of input channels
-                self.num_channels = 20     # The number of channels in each ResidualBlock
+                self.initial_channels = 119  # The number of input channels
+                self.num_channels = 512     # The number of channels in each ResidualBlock
         
                 # The first block will adapt from the initial input channel size to the model's channel size
                 self.layer1 = ResidualBlock(self.initial_channels, self.num_channels)
@@ -151,7 +152,7 @@ class Agent:
                 return policy, value
 
         self._model = Model(args)
-        self.optimizer = torch.optim.Adam(self._model.parameters(), lr=args.learning_rate)
+        self.optimizer = torch.optim.AdamW(self._model.parameters(), lr=args.learning_rate)
 
     @classmethod
     def load(cls, path: str, args: argparse.Namespace) -> "Agent":
@@ -224,10 +225,13 @@ class MCTNode:
         if self.game.winner is not None:
 
             self.children = {}
-            if self.game.winner == self.game.to_play:
+            if self.game.winner == -1:
+                value = 0
+            elif self.game.winner == self.game.to_play:
                 value = 1
             else:
                 value = -1
+
         else:
             agent_board = agent.board(self.game)[np.newaxis]
 
@@ -331,7 +335,7 @@ ReplayBufferEntry = collections.namedtuple("ReplayBufferEntry", ["board", "polic
 
 def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
     # Simulate a game, return a list of `ReplayBufferEntry`s.
-    game = ChessGame(randomized=False)
+    game = ChessGame()
     game_states = []  
     moves = 0
 
