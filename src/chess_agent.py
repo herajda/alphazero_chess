@@ -360,7 +360,7 @@ ReplayBufferEntry = collections.namedtuple("ReplayBufferEntry", ["board", "polic
 
 def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
     # Simulate a game, return a list of `ReplayBufferEntry`s.
-    game = ChessGame()
+    game = ChessGame(gui_enabled=True)
     game_states = []  
     moves = 0
 
