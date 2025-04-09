@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+# nvim swap files
+*.swp
+*.swo
+
 # Distribution / packaging
 .Python
 build/
