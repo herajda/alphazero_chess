@@ -23,7 +23,7 @@ parser.add_argument("--epsilon", default=0.25, type=float, help="MCTS exploratio
 parser.add_argument("--evaluate_each", default=1, type=int, help="Evaluate each number of iterations.")
 parser.add_argument("--learning_rate", default=0.001, type=float, help="Learning rate.")
 parser.add_argument("--model_path", default="model.pt", type=str, help="Model path")
-parser.add_argument("--num_simulations", default=500, type=int, help="Number of simulations in one MCTS.")
+parser.add_argument("--num_simulations", default=10, type=int, help="Number of simulations in one MCTS.")
 parser.add_argument("--sampling_moves", default=3, type=int, help="Sampling moves.")
 parser.add_argument("--show_sim_games", default=False, action="store_true", help="Show simulated games.")
 parser.add_argument("--sim_games", default=20, type=int, help="Simulated games to generate in every iteration.")
@@ -389,6 +389,7 @@ def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
         game_states.append((game.board, policy))
     
     game_winnner = game.winner
+    game.gui.root.mainloop()
     entries = [ReplayBufferEntry(board, policy, game_winnner) for board, policy in game_states]
     return entries
 def simulate_single_game(args):

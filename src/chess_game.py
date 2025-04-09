@@ -101,35 +101,50 @@ class ChessGame(BoardGame):
     @property
     def to_play(self):
         return int(self._board.turn)
-
 class ChessGUI:
     def __init__(self, game):
         """Initialize the GUI with a reference to the ChessGame."""
         self.game = game
         self.root = tk.Tk()
         self.root.title("Chess Game")
-        self.labels = {}  # To store board square labels
+        self.labels = {}
+        self.game_ended = False  # Flag to track if game has ended
 
-        # Create an 8x8 grid of labels for the chessboard
+        # Create board labels with alternating colors
         for row in range(8):
             for col in range(8):
-                label = tk.Label(self.root, width=4, height=2, borderwidth=1, relief="solid")
-                label.grid(row=7 - row, column=col)  # Flip row to match chess notation
+                bg_color = 'white' if (row + col) % 2 == 0 else 'gray'
+                label = tk.Label(self.root, width=4, height=2, bg=bg_color, borderwidth=1, relief="solid")
+                label.grid(row=7 - row, column=col)
                 self.labels[(row, col)] = label
 
-        # Initial display update
+        # Initial update
         self.update_display()
 
     def update_display(self):
-        """Update the GUI to reflect the current board state."""
+        """Update the GUI to reflect the current board state and handle game end."""
+        # Update the board display with current pieces
         board = self.game.get_board_state()
         for row in range(8):
             for col in range(8):
-                square = chess.square(col, row)  # Convert to python-chess square index
+                square = chess.square(col, row)
                 piece = board.piece_at(square)
                 text = piece.symbol() if piece else "."
                 self.labels[(row, col)].config(text=text)
-        # Process GUI events without blocking
+
+        # Check if the game has ended
+        winner = self.game.winner
+        if winner is not None and not self.game_ended:
+            self.game_ended = True  # Set flag to prevent repeated triggers
+            # Determine the color based on the winner
+            color = 'red' if winner == 1 else 'green' if winner == 0 else 'yellow'
+            # Change background color of all squares
+            for label in self.labels.values():
+                label.config(bg=color)
+            # Schedule the window to close after 10 seconds (10000 ms)
+            self.root.after(10000, self.close)
+
+        # Refresh the GUI to show changes immediately
         self.root.update()
 
     def close(self):
