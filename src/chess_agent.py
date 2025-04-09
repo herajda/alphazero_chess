@@ -81,6 +81,11 @@ def adjust_learning_rate(optimizer, iteration, args):
     lr = args.learning_rate - (args.learning_rate - args.final_learning_rate) * (iteration / args.total_decay_iterations)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+# Add the initializer function
+def init_worker():
+    seed = os.getpid()
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 class Agent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -198,6 +203,7 @@ class Agent:
 
     def predict(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         boards = boards.to(self.device)
+        self._model.eval()
         with torch.no_grad():
             policy, value = self._model(boards)
         return policy.detach().cpu().numpy(), value.detach().cpu().numpy()
@@ -404,7 +410,7 @@ def train(args: argparse.Namespace) -> Agent:
 
         print(f"Iteration {iteration}:")
         # Generate simulated games
-        with Pool(processes=args.processes) as pool:
+        with Pool(processes=args.processes, initializer=init_worker) as pool:
             games = pool.map(simulate_single_game, [args] * args.sim_games)
 
             for game in games:
