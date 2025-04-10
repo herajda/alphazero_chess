@@ -356,7 +356,6 @@ def mcts(game: ChessGame, agent: Agent, args: argparse.Namespace, explore: bool)
     policy = np.zeros(game.ACTIONS, dtype=np.float32)
     total_visits = sum(child.visit_count for child in root.children.values())
 
-    print(root.children.items())
     for action, child in root.children.items():
         if total_visits > 0:
             policy[action] = child.visit_count / total_visits
@@ -373,7 +372,7 @@ def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
     moves = 0
 
     while game.winner is None:
-        print(moves)
+        current_board_tensor = agent.board(game)
         policy = mcts(game, agent, args, explore=True)
 
         mask = np.zeros(game.ACTIONS, dtype=bool)
@@ -385,11 +384,10 @@ def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
         else:
             action = np.random.choice(np.arange(game.ACTIONS), p=policy)
 
+        game_states.append((current_board_tensor, policy))
         game.move(action)
         moves += 1
 
-        game_states.append((game.board, policy))
-    
     game_winnner = game.winner
     game.gui.root.mainloop()
     entries = [ReplayBufferEntry(board, policy, game_winnner) for board, policy in game_states]
