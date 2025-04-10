@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", default=None, type=int, help="Random seed.")
 parser.add_argument("--threads", default=1, type=int, help="Maximum number of threads to use.")
-parser.add_argument("--processes", default=1, type=int, help="Maximum number of threads for generation to use.")
+parser.add_argument("--processes", default=6, type=int, help="Maximum number of threads for generation to use.")
 parser.add_argument("--alpha", default=0.3, type=float, help="MCTS root Dirichlet alpha")
 parser.add_argument("--batch_size", default=1, type=int, help="Number of game positions to train on.")
 parser.add_argument("--epsilon", default=0.25, type=float, help="MCTS exploration epsilon in root")
@@ -26,7 +26,7 @@ parser.add_argument("--model_path", default="model.pt", type=str, help="Model pa
 parser.add_argument("--num_simulations", default=100, type=int, help="Number of simulations in one MCTS.")
 parser.add_argument("--sampling_moves", default=3, type=int, help="Sampling moves.")
 parser.add_argument("--show_sim_games", default=False, action="store_true", help="Show simulated games.")
-parser.add_argument("--sim_games", default=1, type=int, help="Simulated games to generate in every iteration.")
+parser.add_argument("--sim_games", default=6, type=int, help="Simulated games to generate in every iteration.")
 parser.add_argument("--train_for", default=1, type=int, help="Update steps in every iteration.")
 parser.add_argument("--window_length", default=100_000, type=int, help="Replay buffer max length.")
 parser.add_argument("--final_learning_rate", default=0.0001, type=float, help="Final minimum learning rate.")
@@ -394,53 +394,107 @@ def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
     game.gui.root.mainloop()
     entries = [ReplayBufferEntry(board, policy, game_winnner) for board, policy in game_states]
     return entries
-def simulate_single_game(args):
-    agent = Agent(args)  
-    return sim_game(agent, args)
+def simulate_single_game(packed_args_and_state):
+    args, state_dict = packed_args_and_state # Unpack the arguments
+
+    # Create a new agent instance IN THE WORKER PROCESS
+    # This agent might be on CPU or GPU depending on args and availability
+    worker_agent = Agent(args)
+
+    # Load the state_dict received from the main process
+    worker_agent._model.load_state_dict(state_dict)
+
+    return sim_game(worker_agent, args)
+
 
 def train(args: argparse.Namespace) -> Agent:
     agent = Agent(args)
-    # TODO implement ReplayBuffer
     replay_buffer = ReplayBuffer(max_length=args.window_length)
 
     iteration = 0
     training = True
+    score_deque = collections.deque(maxlen=5) # Still needs implementation for evaluation
 
-    score_deque = collections.deque(maxlen=5)
-    
+    # Ensure init_worker is defined or imported if needed for seeding
+    # def init_worker():
+    #     seed = os.getpid() + iteration # Add iteration for potentially more unique seeds
+    #     np.random.seed(seed)
+    #     torch.manual_seed(seed)
+
     while training:
         iteration += 1
-
         print(f"Iteration {iteration}:")
-        # Generate simulated games
+
+        # --- Prepare state dict for workers ---
+        agent._model.eval() # Good practice before getting state_dict if dropout/batchnorm are used
+                            # Although workers call eval() again, doesn't hurt.
+
+        # Get the current state dictionary from the agent's model
+        current_state_dict = agent._model.state_dict()
+
+        # IMPORTANT: Move the state_dict to CPU before sending to workers
+        # This ensures it can be pickled and sent regardless of worker device (CPU/GPU)
+        cpu_state_dict = {k: v.cpu() for k, v in current_state_dict.items()}
+        # ------------------------------------
+
+        # Generate simulated games using the POOL
+        # Pass the init_worker for proper seeding in each process
         with Pool(processes=args.processes, initializer=init_worker) as pool:
-            games = pool.map(simulate_single_game, [args] * args.sim_games)
+            # Prepare arguments for each worker: a tuple of (args, cpu_state_dict)
+            worker_args = [(args, cpu_state_dict)] * args.sim_games
 
-            for game in games:
-                replay_buffer.extend(game)
+            # Map the simulate_single_game function over the arguments
+            games_data = pool.map(simulate_single_game, worker_args)
 
+            # games_data is now a list of lists of ReplayBufferEntry
+            for game_entries in games_data:
+                replay_buffer.extend(game_entries)
 
-
+        # --- Training Phase ---
+        agent._model.train() # Set model back to training mode
         adjust_learning_rate(agent.optimizer, iteration, args)
-        for _ in range(args.train_for):
-            # Perform training by sampling an `args.batch_size` of positions
-            # from the `replay_buffer` and running `agent.train` on them.
-            samples = replay_buffer.sample(args.batch_size)
-            boards, policies, outcome = map(np.array, zip(*samples))
 
-            agent.train(torch.tensor(boards, dtype=torch.float32),
-                        torch.tensor(policies, dtype=torch.float32),
-                        torch.tensor(outcome, dtype=torch.float32)) 
+        # Check if buffer has enough samples for a batch
+        if len(replay_buffer) >= args.batch_size:
+            for _ in range(args.train_for):
+                samples = replay_buffer.sample(args.batch_size)
+                # Check if sampling returned enough items (can happen if buffer < batch_size)
+                if not samples:
+                    print("Warning: Replay buffer smaller than batch size, skipping training step.")
+                    break
+                boards, policies, outcome = map(np.array, zip(*samples))
 
+                # Ensure outcomes are properly shaped for MSE loss (e.g., [batch_size])
+                # The original outcome might be single values, ensure they are float tensors
+                outcomes_tensor = torch.tensor(outcome, dtype=torch.float32)
+                # If value is shape [batch_size, 1], ensure target is too, or squeeze value
+                # Current network outputs [batch_size, 1], so target should be [batch_size, 1] or value squeezed
+                # Let's make target [batch_size] to match squeezed value head output
+                # value = value.squeeze(-1) in agent.train suggests target should be [batch_size]
+
+                agent.train(torch.tensor(boards, dtype=torch.float32),
+                            torch.tensor(policies, dtype=torch.float32),
+                            outcomes_tensor) # Pass the correctly typed tensor
+        else:
+             print(f"Replay buffer size {len(replay_buffer)} < batch size {args.batch_size}, skipping training.")
+
+        # --- Evaluation / Stopping Condition ---
         if iteration % args.evaluate_each == 0:
+            # TODO: Implement actual evaluation (e.g., play vs baseline/previous version)
+            # and update score_deque based on evaluation results.
+            print(f"Evaluation step needed at iteration {iteration}")
+            # Example placeholder: if np.mean(np.array(score_deque)) > 0.9:
+            #     training = False
+            pass # Replace pass with evaluation logic
 
-            if np.mean(np.array(score_deque)) > 0.9:
-                training = False
+        # Optional: Save checkpoints periodically
+        if iteration % 50 == 0: # Save every 50 iterations, adjust as needed
+             print(f"Saving checkpoint at iteration {iteration}")
+             agent.save(f"model_checkpoint_{iteration}.pt")
+
 
     agent.save(args.model_path)
-
     return agent
-
 
 # Evaluation Player 
 class Player:
