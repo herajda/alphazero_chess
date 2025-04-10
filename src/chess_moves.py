@@ -128,6 +128,11 @@ def action_to_uci(board, action):
 
     if move in board.legal_moves:
         return move.uci()
+    else:
+        move.promotion = chess.QUEEN 
+        if move in board.legal_moves:
+            return move.uci()
+
     return None
 
 def flatten_action(file, rank, move_type):
