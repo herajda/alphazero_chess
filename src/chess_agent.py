@@ -16,18 +16,18 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", default=None, type=int, help="Random seed.")
 parser.add_argument("--threads", default=1, type=int, help="Maximum number of threads to use.")
-parser.add_argument("--processes", default=6, type=int, help="Maximum number of threads for generation to use.")
+parser.add_argument("--processes", default=1, type=int, help="Maximum number of threads for generation to use.")
 parser.add_argument("--alpha", default=0.3, type=float, help="MCTS root Dirichlet alpha")
-parser.add_argument("--batch_size", default=64, type=int, help="Number of game positions to train on.")
+parser.add_argument("--batch_size", default=1, type=int, help="Number of game positions to train on.")
 parser.add_argument("--epsilon", default=0.25, type=float, help="MCTS exploration epsilon in root")
 parser.add_argument("--evaluate_each", default=1, type=int, help="Evaluate each number of iterations.")
 parser.add_argument("--learning_rate", default=0.001, type=float, help="Learning rate.")
 parser.add_argument("--model_path", default="model.pt", type=str, help="Model path")
-parser.add_argument("--num_simulations", default=10, type=int, help="Number of simulations in one MCTS.")
+parser.add_argument("--num_simulations", default=100, type=int, help="Number of simulations in one MCTS.")
 parser.add_argument("--sampling_moves", default=3, type=int, help="Sampling moves.")
 parser.add_argument("--show_sim_games", default=False, action="store_true", help="Show simulated games.")
-parser.add_argument("--sim_games", default=20, type=int, help="Simulated games to generate in every iteration.")
-parser.add_argument("--train_for", default=100, type=int, help="Update steps in every iteration.")
+parser.add_argument("--sim_games", default=1, type=int, help="Simulated games to generate in every iteration.")
+parser.add_argument("--train_for", default=1, type=int, help="Update steps in every iteration.")
 parser.add_argument("--window_length", default=100_000, type=int, help="Replay buffer max length.")
 parser.add_argument("--final_learning_rate", default=0.0001, type=float, help="Final minimum learning rate.")
 parser.add_argument("--total_decay_iterations", default=100, type=int, help="Total iterations over which the learning rate will decay linearly.")
@@ -340,6 +340,7 @@ def mcts(game: ChessGame, agent: Agent, args: argparse.Namespace, explore: bool)
                 node.evaluate(game, agent)
 
         else:
+            # this should not happen
             node.evaluate(game, agent)
 
         # Get the value of the node.
@@ -355,6 +356,7 @@ def mcts(game: ChessGame, agent: Agent, args: argparse.Namespace, explore: bool)
     policy = np.zeros(game.ACTIONS, dtype=np.float32)
     total_visits = sum(child.visit_count for child in root.children.values())
 
+    print(root.children.items())
     for action, child in root.children.items():
         if total_visits > 0:
             policy[action] = child.visit_count / total_visits
