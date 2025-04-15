@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", default=None, type=int, help="Random seed.")
 parser.add_argument("--threads", default=1, type=int, help="Maximum number of threads to use.")
-parser.add_argument("--processes", default=6, type=int, help="Maximum number of threads for generation to use.")
+parser.add_argument("--processes", default=1, type=int, help="Maximum number of threads for generation to use.")
 parser.add_argument("--alpha", default=0.3, type=float, help="MCTS root Dirichlet alpha")
 parser.add_argument("--batch_size", default=1, type=int, help="Number of game positions to train on.")
 parser.add_argument("--epsilon", default=0.25, type=float, help="MCTS exploration epsilon in root")
@@ -26,7 +26,7 @@ parser.add_argument("--model_path", default="model.pt", type=str, help="Model pa
 parser.add_argument("--num_simulations", default=100, type=int, help="Number of simulations in one MCTS.")
 parser.add_argument("--sampling_moves", default=3, type=int, help="Sampling moves.")
 parser.add_argument("--show_sim_games", default=False, action="store_true", help="Show simulated games.")
-parser.add_argument("--sim_games", default=6, type=int, help="Simulated games to generate in every iteration.")
+parser.add_argument("--sim_games", default=1, type=int, help="Simulated games to generate in every iteration.")
 parser.add_argument("--train_for", default=1, type=int, help="Update steps in every iteration.")
 parser.add_argument("--window_length", default=100_000, type=int, help="Replay buffer max length.")
 parser.add_argument("--final_learning_rate", default=0.0001, type=float, help="Final minimum learning rate.")
@@ -264,18 +264,12 @@ class MCTNode:
         else:
             agent_board = torch.from_numpy(agent.board(self.game)[np.newaxis])
 
-            policy, _ = agent.predict(agent_board)
+            policy, predicted_value_tensor = agent.predict(agent_board) 
             policy = policy[0]
 
             valid_actions = self.game.valid_actions()
             self.children = {action: MCTNode(policy[action]) for action in valid_actions}
-            
-            # NOTE: don't think I need this
-            #total = sum(policy[action] for action in valid_actions)
-            #for action in valid_actions:
-            #    self.children[action].prior /= total
-
-            value = self.value()
+            value = predicted_value_tensor[0, 0]
 
         self.visit_count, self.total_value = 1, value
 
