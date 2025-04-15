@@ -303,6 +303,18 @@ class MCTNode:
             policy = policy[0]
 
             valid_actions = self.game.valid_actions()
+            mask = np.zeros_like(policy)
+            mask[valid_actions] = 1
+            
+            # Apply mask and renormalize
+            policy *= mask  # Zero out invalid actions
+            policy_sum = policy.sum()
+            
+            if policy_sum < 1e-8:  # Handle division by zero
+                # Uniform distribution over valid moves if sum is near zero
+                policy[valid_actions] = 1 / len(valid_actions)
+            else:
+                policy /= policy_sum  # Normalize valid actions
             self.children = {action: MCTNode(policy[action]) for action in valid_actions}
             value = predicted_value_tensor[0, 0]
 
