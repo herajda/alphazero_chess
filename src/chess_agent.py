@@ -79,7 +79,8 @@ class ReplayBuffer:
             return [self._data[index] for index in generator.choice(len(self._data), size=size, replace=False)]
 
 def adjust_learning_rate(optimizer, iteration, args):
-    lr = args.learning_rate - (args.learning_rate - args.final_learning_rate) * (iteration / args.total_decay_iterations)
+    lr = max(args.learning_rate - (args.learning_rate - args.final_learning_rate) * (iteration / args.total_decay_iterations), args.final_learning_rate)
+
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 # Add the initializer function
