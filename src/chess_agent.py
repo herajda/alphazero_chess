@@ -321,16 +321,29 @@ class MCTNode:
         self.visit_count, self.total_value = 1, value
 
     def add_exploration_noise(self, epsilon: float, alpha: float) -> None:
-        num_children = len(self.children)
-        if num_children == 0:
-            return # No children to add noise to
-        
-        noise = np.random.dirichlet([alpha] * num_children)
-        child_items = list(self.children.items()) # Get a fixed order
-        
-        for i, (action, child) in enumerate(child_items):
-            child.prior = epsilon * noise[i] + (1 - epsilon) * child.prior
-        
+       num_children = len(self.children)
+       if num_children == 0:
+           return
+       
+       child_items = list(self.children.items())
+       noise = np.random.dirichlet([alpha] * num_children)
+       
+       # Apply noise and calculate new priors
+       new_priors = []
+       for i, (action, child) in enumerate(child_items):
+           new_prior = epsilon * noise[i] + (1 - epsilon) * child.prior
+           new_priors.append(new_prior)
+       
+       # Explicit normalization to handle numerical stability
+       total = sum(new_priors)
+       if total <= 1e-8:  # Fallback to uniform distribution if sum is near zero
+           new_priors = [1/num_children] * num_children
+       else:
+           new_priors = [p / total for p in new_priors]
+
+       # Update children with normalized priors
+       for i, (action, child) in enumerate(child_items):
+           child.prior = new_priors[i]       
 
     def select_child(self) -> tuple[int, "MCTNode"]:
         def ucb_score(child: "MCTNode"):
