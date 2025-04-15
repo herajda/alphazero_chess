@@ -274,11 +274,15 @@ class MCTNode:
         self.visit_count, self.total_value = 1, value
 
     def add_exploration_noise(self, epsilon: float, alpha: float) -> None:
-        # TODO: Update the children priors by exploration noise
-        # Dirichlet(alpha), so that the resulting priors are
-        #   epsilon * Dirichlet(alpha) + (1 - epsilon) * original_prior
-        for _, child in self.children.items():
-            child.prior = epsilon * np.random.dirichlet([alpha]) + (1 - epsilon) * child.prior
+        num_children = len(self.children)
+        if num_children == 0:
+            return # No children to add noise to
+        
+        noise = np.random.dirichlet([alpha] * num_children)
+        child_items = list(self.children.items()) # Get a fixed order
+        
+        for i, (action, child) in enumerate(child_items):
+            child.prior = epsilon * noise[i] + (1 - epsilon) * child.prior
         
 
     def select_child(self) -> tuple[int, "MCTNode"]:
