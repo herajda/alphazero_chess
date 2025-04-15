@@ -382,13 +382,21 @@ def sim_game(agent: Agent, args: argparse.Namespace) -> list[ReplayBufferEntry]:
         else:
             action = np.random.choice(np.arange(game.ACTIONS), p=policy)
 
-        game_states.append((current_board_tensor, policy))
+        game_states.append((current_board_tensor, policy, game.to_play))
         game.move(action)
         moves += 1
 
-    game_winnner = game.winner
-    game.gui.root.mainloop()
-    entries = [ReplayBufferEntry(board, policy, game_winnner) for board, policy in game_states]
+    game_winner = game.winner
+    # Compute outcome z from the perspective of the player to move
+    entries = []
+    for board, policy, to_play in game_states:
+        if game_winner == -1:  # Draw
+            z = 0
+        elif game_winner == to_play:  # Player to move wins
+            z = 1
+        else:  # Player to move loses
+            z = -1
+        entries.append(ReplayBufferEntry(board, policy, z))
     return entries
 def simulate_single_game(packed_args_and_state):
     args, state_dict = packed_args_and_state # Unpack the arguments
