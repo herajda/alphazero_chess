@@ -107,7 +107,7 @@ class Agent:
                 self.input_proj = nn.Conv2d(self.initial_channels, self.dim_model, kernel_size=1)
                 
                 # Positional encoding
-                self.pos_encoding = self.create_positional_encoding()
+                self.register_buffer("pos_encoding", self.create_positional_encoding())
                 
                 # Transformer layers
                 encoder_layer = nn.TransformerEncoderLayer(
@@ -181,7 +181,7 @@ class Agent:
                 x = x.transpose(1, 2)  # [batch_size, 64, 512]
                 
                 # --- Add 2D Positional Encoding ---
-                x = x + self.pos_encoding.to(x.device)  # [batch_size, 64, 512]
+                x = x + self.pos_encoding # [batch_size, 64, 512]
                 
                 # --- Transformer Layers ---
                 x = self.transformer(x)  # [batch_size, 64, 512]
