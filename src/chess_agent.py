@@ -131,7 +131,7 @@ class Agent:
                 self.value_conv = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
                 self.value_flatten = nn.Flatten()
                 self.value_dense = nn.Linear(self.board_size * self.board_size, 1)
-                
+
             def create_positional_encoding(self):
                 # Initialize positional encoding for 8x8 board
                 pe = torch.zeros(self.board_size, self.board_size, self.dim_model)
@@ -404,12 +404,13 @@ def mcts(game: ChessGame, agent: Agent, args: argparse.Namespace, explore: bool)
 
         # Get the value of the node.
         value = node.value()
-
-        for node, action in reversed(path):
-            node.visit_count += 1
-            node.total_value += value
-            # Invert the value for the opponent's perspective
-            value = -value  
+        
+        if path:
+            for node, action in reversed(path[:-1]): # exclude leaf
+                node.visit_count += 1
+                node.total_value += value
+                # Invert the value for the opponent's perspective
+                value = -value  
         path = []
 
     policy = np.zeros(game.ACTIONS, dtype=np.float32)
