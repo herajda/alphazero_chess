@@ -30,6 +30,7 @@ parser.add_argument("--sim_games", default=1, type=int, help="Simulated games to
 parser.add_argument("--train_for", default=1, type=int, help="Update steps in every iteration.")
 parser.add_argument("--window_length", default=100_000, type=int, help="Replay buffer max length.")
 parser.add_argument("--final_learning_rate", default=0.0001, type=float, help="Final minimum learning rate.")
+parser.add_argument("--weight_decay", default=0.001, type=float, help="Weight decay for AdamW.")
 parser.add_argument("--total_decay_iterations", default=100, type=int, help="Total iterations over which the learning rate will decay linearly.")
 parser.add_argument("--infer", default=False, type=bool, help="Inference mode ON or OFF.")
 
@@ -209,7 +210,7 @@ class Agent:
 
 
         self._model = TransformerModel(args).to(self.device)
-        self.optimizer = torch.optim.AdamW(self._model.parameters(), lr=args.learning_rate)
+        self.optimizer = torch.optim.AdamW(self._model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     @classmethod
     def load(cls, path: str, args) -> "Agent":
