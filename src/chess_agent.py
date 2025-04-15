@@ -193,7 +193,7 @@ class Agent:
         
         policy, value = self._model(boards)
         value = value.squeeze(-1)
-        loss_policy = -torch.sum(target_policies * torch.log_softmax(policy, dim=1), dim=1).mean()
+        loss_policy = -torch.sum(target_policies * torch.log(policy + 1e-8), dim=1).mean()
         loss_value = F.mse_loss(value, target_values)
         loss = loss_policy + loss_value
         
