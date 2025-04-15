@@ -193,9 +193,9 @@ class Agent:
         
         policy, value = self._model(boards)
         value = value.squeeze(-1)
-        
-        loss = (F.cross_entropy(policy, target_policies) + 
-                F.mse_loss(value, target_values))
+        loss_policy = -torch.sum(target_policies * torch.log_softmax(policy, dim=1), dim=1).mean()
+        loss_value = F.mse_loss(value, target_values)
+        loss = loss_policy + loss_value
         
         self.optimizer.zero_grad()
         loss.backward()
