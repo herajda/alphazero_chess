@@ -1,147 +1,218 @@
 #include "chess_game.h"
-#include <unordered_map>
 #include <algorithm>
+#include <stdexcept>
 
-// Action mapping functions (ported from chess_moves.py)
-int uci_to_action(const Board& board, const std::string& uci) {
-    // Port uci_to_action from chess_moves.py
-    // Input: UCI string (e.g., "e2e4")
-    // Output: Action index (0–4671) or -1 if invalid
-    // Implement logic for queen moves, knight moves, underpromotions
-    // Example (simplified):
-    Move move = Move::from_uci(uci);
-    if (!board.is_legal(move)) return -1;
-    int from_square = move.from_square();
-    int to_square = move.to_square();
-    int from_file = from_square % 8;
-    int from_rank = from_square / 8;
-    int delta_file = (to_square % 8) - from_file;
-    int delta_rank = (to_square / 8) - from_rank;
-    // Map to one of 73 move types (see chess_moves.py)
-    // Return from_file + 8 * from_rank + 64 * move_type
-    return -1; // Placeholder
-}
+using U64 = std::uint64_t;
 
-std::string action_to_uci(const Board& board, int action) {
-    // Port action_to_uci from chess_moves.py
-    // Input: Action index (0–4671)
-    // Output: UCI string (e.g., "e2e4") or empty if invalid
-    if (action < 0 || action >= ACTIONS) return "";
-    int move_type = action / 64;
-    int temp = action % 64;
-    int rank = temp / 8;
-    int file = temp % 8;
-    // Map to UCI based on move_type (queen, knight, underpromotion)
-    return ""; // Placeholder
-}
-
-ChessGame::ChessGame() : board(std::make_unique<Board>()) {}
-
-std::unique_ptr<ChessGame> ChessGame::clone(bool swap_players) const {
-    auto clone = std::make_unique<ChessGame>();
-    clone->board = std::make_unique<Board>(*board);
-    if (swap_players) clone->board->set_turn(!board->turn());
-    clone->history.resize(history.size());
-    for (size_t i = 0; i < history.size(); ++i) {
-        clone->history[i] = std::make_unique<Board>(*history[i]);
-    }
+// Clone the game state, optionally swapping players
+ChessGame ChessGame::clone() const {
+    ChessGame clone;
     return clone;
 }
 
-std::vector<float> ChessGame::get_tensor() const {
-    std::vector<float> tensor(N * N * C, 0.0f);
-    bool p1 = board->turn();
-    bool p2 = !p1;
-
-    // Get history (up to 8 positions)
-    std::vector<std::string> fens;
-    fens.push_back(board->fen());
-    for (size_t i = 0; i < history.size() && i < 7; ++i) {
-        fens.push_back(history[history.size() - 1 - i]->fen());
+chess::Board ChessGame::current_board() const {
+    if () {
+        throw std::runtime_error("No board history available.");
     }
-    std::reverse(fens.begin(), fens.end());
+    return _boards.back();
 
-    // Count repetitions
-    std::unordered_map<std::string, int> fen_counts;
-    std::vector<int> counts;
-    for (const auto& fen : fens) {
-        fen_counts[fen]++;
-        counts.push_back(fen_counts[fen]);
-    }
-
-    // Fill piece planes
-    for (size_t t = 0; t < std::min<size_t>(8, fens.size()); ++t) {
-        Board& b = t == fens.size() - 1 ? *board : *history[t];
-        for (int i = 0; i < 8; ++i) {
-            for (int j = 0; j < 8; ++j) {
-                int square = p1 ? (j + i * 8) : (j + (7 - i) * 8);
-                auto piece = b.piece_at(square);
-                if (piece) {
-                    bool color = piece.color();
-                    int piece_type = piece.type() - 1; // 0=pawn, ..., 5=king
-                    int plane = color == p1 ? piece_type : 6 + piece_type;
-                    tensor[i * N * C + j * C + t * 14 + plane] = 1.0f;
-                }
-            }
-        }
-        if (counts[t] >= 2) {
-            for (int i = 0; i < N; ++i)
-                for (int j = 0; j < N; ++j)
-                    tensor[i * N * C + j * C + t * 14 + 12] = 1.0f;
-        }
-    }
-
-    // Constant planes
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j < N; ++j) {
-            tensor[i * N * C + j * C + 112] = p1 ? 1.0f : 0.0f;
-            tensor[i * N * C + j * C + 113] = board->fullmove_number() / 1000.0f;
-            tensor[i * N * C + j * C + 114] = board->has_kingside_castling_rights(p1) ? 1.0f : 0.0f;
-            tensor[i * N * C + j * C + 115] = board->has_queenside_castling_rights(p1) ? 1.0f : 0.0f;
-            tensor[i * N * C + j * C + 116] = board->has_kingside_castling_rights(p2) ? 1.0f : 0.0f;
-            tensor[i * N * C + j * C + 117] = board->has_queenside_castling_rights(p2) ? 1.0f : 0.0f;
-            tensor[i * N * C + j * C + 118] = board->halfmove_clock() / 50.0f;
-        }
-    }
-    return tensor;
+}
+chess::Board ChessGame::current_board() {
+    return board_history.get_latest_board();
 }
 
+// Return the current player (0 for White, 1 for Black)
 int ChessGame::to_play() const {
-    return board->turn() ? 1 : 0;
+    return static_cast<int>(_board.sideToMove());
 }
 
-std::optional<int> ChessGame::winner() const {
-    auto result = board->result();
-    if (result == "*") return std::nullopt;
-    if (result == "1-0") return 1;
-    if (result == "0-1") return 0;
-    return -1;
+// Check if an action is valid
+bool ChessGame::valid(int action) const {
+    chess::Move move = action_to_move(action);
+    if (move == chess::Move::NO_MOVE) return false;
+    chess::Movelist moves;
+    chess::movegen::legalmoves(moves, _board);
+    return std::find(moves.begin(), moves.end(), move) != moves.end();
 }
 
-std::vector<int> ChessGame::legal_actions() const {
+// Return a list of valid action indices
+std::vector<int> ChessGame::valid_actions() const {
+    chess::Movelist moves;
+    chess::movegen::legalmoves(moves, _board);
     std::vector<int> actions;
-    for (const auto& uci : board->legal_moves()) {
-        int action = uci_to_action(*board, uci);
-        if (action >= 0 && action < ACTIONS) actions.push_back(action);
+    actions.reserve(moves.size());
+    for (const auto& move : moves) {
+        int action = move_to_action(move);
+        if (action != -1) {
+            actions.push_back(action);
+        }
     }
     return actions;
 }
 
-void ChessGame::make_move(int action) {
-    std::string uci = action_to_uci(*board, action);
-    if (!uci.empty()) {
-        history.push_back(std::make_unique<Board>(*board));
-        board->move(uci);
+// Execute a move based on the action index
+void ChessGame::move(int action) {
+    chess::Move move = action_to_move(action);
+    if (move == chess::Move::NO_MOVE || !valid(action)) {
+        throw std::invalid_argument("Invalid action: " + std::to_string(action));
+    }
+    _board.makeMove(move);
+}
+
+// Determine the winner: -2 (not over), -1 (draw), 0 (White), 1 (Black)
+int ChessGame::winner() const {
+    auto [reason, result] = _board.isGameOver();
+    if (result == chess::GameResult::WIN) {
+        return static_cast<int>(_board.sideToMove());
+    } else if (result == chess::GameResult::LOSE) {
+        return static_cast<int>(~_board.sideToMove());
+    } else if (result == chess::GameResult::DRAW) {
+        return -1;
+    } else {
+        return -2;
     }
 }
 
-void ChessGame::undo_move() {
-    if (!history.empty()) {
-        board = std::move(history.back());
-        history.pop_back();
+// Convert a Move object to an action index
+int ChessGame::move_to_action(const chess::Move& move) const {
+    chess::Square from = move.from();
+    chess::Square to = move.to();
+    int from_file = from.file();
+    int from_rank = from.rank();
+    int delta_file = to.file() - from_file;
+    int delta_rank = to.rank() - from_rank;
+
+    // Underpromotions
+    if (move.typeOf() == chess::Move::PROMOTION && move.promotionType() != chess::PieceType::QUEEN) {
+        int expected_rank = (_board.sideToMove() == chess::Color::WHITE) ? 7 : 0;
+        if (to.rank() == expected_rank && std::abs(delta_file) <= 1) {
+            int direction = (delta_file == -1) ? 0 : (delta_file == 0) ? 1 : 2;
+            int piece_idx = static_cast<int>(move.promotionType()) - 2;
+            int move_type_index = 64 + 3 * piece_idx + direction;
+            return from_file + 8 * from_rank + 64 * move_type_index;
+        }
+        return -1;
+    }
+
+    // Knight moves
+    chess::Piece piece = _board.at<chess::Piece>(from);
+    if (piece.type() == chess::PieceType::KNIGHT) {
+        for (int k = 0; k < 8; ++k) {
+            if (delta_file == KNIGHT_DELTAS[k].first && delta_rank == KNIGHT_DELTAS[k].second) {
+                int move_type_index = 56 + k;
+                return from_file + 8 * from_rank + 64 * move_type_index;
+            }
+        }
+        return -1;
+    }
+
+    // Sliding moves
+    for (int dir_idx = 0; dir_idx < 8; ++dir_idx) {
+        int df = DIRECTIONS[dir_idx].first;
+        int dr = DIRECTIONS[dir_idx].second;
+        if ((df == 0 && delta_file == 0 && dr * delta_rank > 0) ||
+            (dr == 0 && delta_rank == 0 && df * delta_file > 0) ||
+            (df != 0 && dr != 0 && delta_file * dr == delta_rank * df && delta_file * df > 0)) {
+            int steps = (df == 0) ? std::abs(delta_rank) : std::abs(delta_file);
+            if (1 <= steps && steps <= 7) {
+                int move_type_index = dir_idx * 7 + (steps - 1);
+                return from_file + 8 * from_rank + 64 * move_type_index;
+            }
+        }
+    }
+    return -1;
+}
+
+// Convert an action index to a Move object
+chess::Move ChessGame::action_to_move(int action) const {
+    if (action < 0 || action >= ACTIONS) return chess::Move::NO_MOVE;
+    int move_type = action / 64;
+    int temp = action % 64;
+    int rank = temp / 8;
+    int file = temp % 8;
+    chess::Square from = chess::Square(file, rank);
+
+    if (move_type <= 55) { // Sliding moves
+        int dir_idx = move_type / 7;
+        int step = (move_type % 7) + 1;
+        int df = DIRECTIONS[dir_idx].first;
+        int dr = DIRECTIONS[dir_idx].second;
+        int to_file = file + df * step;
+        int to_rank = rank + dr * step;
+        if (to_file >= 0 && to_file < 8 && to_rank >= 0 && to_rank < 8) {
+            chess::Square to = chess::Square(to_file, to_rank);
+            chess::Piece piece = _board.at<chess::Piece>(from);
+            if (piece.type() == chess::PieceType::PAWN && to.rank() == (_board.sideToMove() == chess::Color::WHITE ? 7 : 0)) {
+                return chess::Move::make<chess::Move::PROMOTION>(from, to, chess::PieceType::QUEEN);
+            }
+            return chess::Move::make<chess::Move::NORMAL>(from, to);
+        }
+    } else if (move_type <= 63) { // Knight moves
+        int knight_idx = move_type - 56;
+        int df = KNIGHT_DELTAS[knight_idx].first;
+        int dr = KNIGHT_DELTAS[knight_idx].second;
+        int to_file = file + df;
+        int to_rank = rank + dr;
+        if (to_file >= 0 && to_file < 8 && to_rank >= 0 && to_rank < 8) {
+            chess::Square to = chess::Square(to_file, to_rank);
+            return chess::Move::make<chess::Move::NORMAL>(from, to);
+        }
+    } else if (move_type <= 72) { // Underpromotions
+        int piece_idx = (move_type - 64) / 3;
+        int dir_idx = (move_type - 64) % 3;
+        chess::PieceType promotion = static_cast<chess::PieceType>(chess::PieceType::KNIGHT + piece_idx);
+        int delta_file = (dir_idx == 0) ? -1 : (dir_idx == 1) ? 0 : 1;
+        int delta_rank = (_board.sideToMove() == chess::Color::WHITE) ? 1 : -1;
+        int to_file = file + delta_file;
+        int to_rank = rank + delta_rank;
+        int promotion_rank = (_board.sideToMove() == chess::Color::WHITE) ? 7 : 0;
+        if (to_file >= 0 && to_file < 8 && to_rank == promotion_rank) {
+            chess::Square to = chess::Square(to_file, to_rank);
+            return chess::Move::make<chess::Move::PROMOTION>(from, to, promotion);
+        }
+    }
+    return chess::Move::NO_MOVE;
+}
+
+// Fill piece planes for a board state
+void ChessGame::fill_tensor_for_board(const chess::Board& board, chess::Color p1,
+                                      std::vector<std::vector<std::vector<float>>>& tensor,
+                                      int channel_offset) const {
+    chess::Color p2 = ~p1;
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            chess::Square sq = (p1 == chess::Color::WHITE) ? chess::Square(j, i) : chess::Square(j, 7 - i);
+            chess::Piece piece = board.at<chess::Piece>(sq);
+            if (piece != chess::Piece::NONE) {
+                chess::Color color = piece.color();
+                int plane = (color == p1) ? static_cast<int>(piece.type()) - 1 : 6 + static_cast<int>(piece.type()) - 1;
+                tensor[i][j][channel_offset + plane] = 1.0f;
+            }
+        }
     }
 }
 
-bool ChessGame::is_terminal() const {
-    return board->result() != "*";
+// Fill constant planes
+void ChessGame::fill_constant_planes(std::vector<std::vector<std::vector<float>>>& tensor, chess::Color p1) const {
+    float color_value = (p1 == chess::Color::WHITE) ? 1.0f : 0.0f;
+    int total_moves = _board.moveStack().size();
+    float move_count_value = total_moves / 1000.0f;
+    chess::CastlingRights cr = _board.castlingRights();
+    float p1_kingside = cr.hasKingside(p1) ? 1.0f : 0.0f;
+    float p1_queenside = cr.hasQueenside(p1) ? 1.0f : 0.0f;
+    float p2_kingside = cr.hasKingside(~p1) ? 1.0f : 0.0f;
+    float p2_queenside = cr.hasQueenside(~p1) ? 1.0f : 0.0f;
+    float halfmove_value = _board.halfMoveClock() / 50.0f;
+
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            tensor[i][j][112] = color_value;
+            tensor[i][j][113] = move_count_value;
+            tensor[i][j][114] = p1_kingside;
+            tensor[i][j][115] = p1_queenside;
+            tensor[i][j][116] = p2_kingside;
+            tensor[i][j][117] = p2_queenside;
+            tensor[i][j][118] = halfmove_value;
+        }
+    }
 }
