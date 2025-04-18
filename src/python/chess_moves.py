@@ -75,18 +75,19 @@ def uci_to_action(board, uci):
     action = move_to_action(board, move)
     if action:
         from_file, from_rank, move_type = action
-        return from_file + 8 * from_rank + 64 * move_type
+        return (from_file) * 8 * 73 + (from_rank) * 73 + move_type 
     return None
 
 def action_to_uci(board, action):
     """Convert flattened action number to UCI string or None if invalid."""
     if not 0 <= action < 4672:
         return None
-    move_type = action // 64
-    temp = action % 64
-    rank = temp // 8
-    file = temp % 8
+    move_type = action % 73 
+    temp = action // 73
+    file = temp // 8
+    rank = temp % 8
     from_square = chess.square(file, rank)
+    print(f"from_square: {from_square}, file: {file}, rank: {rank}, move_type: {move_type}")
 
     if 0 <= move_type <= 55:  # Queen moves
         dir_idx = move_type // 7
@@ -104,6 +105,7 @@ def action_to_uci(board, action):
         df, dr = KNIGHT_DELTAS[knight_idx]
         to_file = file + df
         to_rank = rank + dr
+        print(f"Knight move: {to_file}, {to_rank}")
         if 0 <= to_file < 8 and 0 <= to_rank < 8:
             to_square = chess.square(to_file, to_rank)
             move = chess.Move(from_square, to_square)
@@ -125,7 +127,6 @@ def action_to_uci(board, action):
             return None
     else:
         return None
-
     if move in board.legal_moves:
         return move.uci()
     else:
