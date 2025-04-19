@@ -5,58 +5,76 @@
 #include <cmath>
 #include <numeric> // std::count
 
-namespace az73::detail {
-    const int  DIR[8]    = {+8, +9, +1, -7, -8, -9, -1, +7};
-    const int  KNIGHT[8] = {+17, +10, -6, -15, -17, -10, +6, +15};
-    const char PROMO[3]  = {'n', 'b', 'r'};
-}
-
-static inline int promo_index(chess::PieceType pt) noexcept {
-    using PT = chess::PieceType;
-    if (pt == PT::KNIGHT) return 0;
-    if (pt == PT::BISHOP) return 1;
-    if (pt == PT::ROOK)   return 2;
-    return -1;
-}
-
 namespace az73 {
+    static constexpr std::array<std::pair<int,int>,8> DIRECTIONS = {{
+        {0, 1}, {1, 1}, {1, 0}, {1, -1}, {0, -1}, {-1, -1}, {-1, 0}, {-1, 1}
+    }};
+    // Knight move deltas in clockwise order
+    static constexpr std::array<std::pair<int,int>,8> KNIGHT_DELTAS = {{
+        {1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}
+    }};
 
-    std::uint32_t encode(const chess::Move& mv) {
-        const int fromIdx = mv.from().index();
-        const int toIdx = mv.to().index();
-        const int df = detail::file(toIdx) - detail::file(fromIdx);
-        const int dr = detail::rank(toIdx) - detail::rank(fromIdx);
+    std::uint32_t encode(const chess::Board& board, const chess::Move& mv) {
 
-        if ((std::abs(df) == 1 && std::abs(dr) == 2) || (std::abs(df) == 2 && std::abs(dr) == 1)) {
-            const int offset = dr * 8 + df;
-            for (int i = 0; i < 8; ++i)
-                if (detail::KNIGHT[i] == offset)
-                    return fromIdx * 73u + 56u + i;
-            throw std::logic_error("encode: knight offset mismatch");
-        }
+        using namespace chess;
+        // Determine perspective
+        const Color toPlay = board.sideToMove();
+        // True squares
+        const Square trueFrom = mv.from();
+        const Square trueTo   = mv.to();
+        // Mirror for Black
+        const Square fromSq = trueFrom.relative_square(toPlay);
+        const Square toSq   = trueTo.relative_square(toPlay);
 
-        if (const int pidx = promo_index(mv.promotionType()); pidx != -1) {
-            const bool white = dr > 0;
-            int dir_idx = (df == 0) ? 1 : (df == -1 ? (white ? 0 : 2) : (white ? 2 : 0));
-            return fromIdx * 73u + 64u + pidx * 3 + dir_idx;
-        }
+        const int file = fromSq.file();
+        const int rank = fromSq.rank();
+        const int df   = toSq.file() - file;
+        const int dr   = toSq.rank() - rank;
 
-        if (df == 0 || dr == 0 || std::abs(df) == std::abs(dr)) {
-            int dir = -1, dist = 0;
-            if (df == 0) dir = dr > 0 ? 0 : 4, dist = std::abs(dr);
-            else if (dr == 0) dir = df > 0 ? 2 : 6, dist = std::abs(df);
-            else {
-                if (df > 0 && dr > 0) dir = 1;
-                else if (df > 0 && dr < 0) dir = 3;
-                else if (df < 0 && dr < 0) dir = 5;
-                else dir = 7;
-                dist = std::abs(df);
+        // Underpromotions (excluding queen)
+        if (mv.typeOf() == chess::Move::PROMOTION && mv.promotionType() != chess::PieceType::QUEEN) {
+            int p    = static_cast<int>(mv.promotionType());        // underlying: KNIGHT=1, BISHOP=2, ROOK=3, QUEEN=4
+            int piece_idx = p - static_cast<int>(chess::PieceType::KNIGHT); // 0,1,2
+            if (abs(df) <= 1 && dr == 1) {
+                int dir = (df == -1 ? 0 : df == 0 ? 1 : 2);
+                int moveType = 64 + piece_idx * 3 + dir;  // 64..72
+                return file * 8 * 73 + rank * 73 + moveType;
             }
-            if (dist == 0 || dist > 7) throw std::logic_error("encode: distance out of range");
-            return fromIdx * 73u + dir * 7u + (dist - 1);
+            return UINT32_MAX;
         }
 
-        throw std::logic_error("encode: unsupported move pattern");
+        // Knight moves
+        if (board.at(trueFrom).type() == chess::PieceType::KNIGHT) {
+            auto it = std::find(KNIGHT_DELTAS.begin(), KNIGHT_DELTAS.end(), std::make_pair(df, dr));
+            if (it != KNIGHT_DELTAS.end()) {
+                int idx = static_cast<int>(std::distance(KNIGHT_DELTAS.begin(), it));
+                int moveType = 56 + idx;  // 56..63
+                return file * 8 * 73 + rank * 73 + moveType;
+            }
+            return UINT32_MAX;
+        }
+
+        // Sliding (queen) moves
+        for (int d = 0; d < 8; ++d) {
+            auto [dx, dy] = DIRECTIONS[d];
+            // Check alignment and step
+            if (dx == 0 && df == 0 && dr * dy > 0 && abs(dr) <= 7) {
+                int k = abs(dr);
+                int moveType = d * 7 + (k - 1);
+                return file * 8 * 73 + rank * 73 + moveType;
+            } else if (dy == 0 && dr == 0 && df * dx > 0 && abs(df) <= 7) {
+                int k = abs(df);
+                int moveType = d * 7 + (k - 1);
+                return file * 8 * 73 + rank * 73 + moveType;
+            } else if (dx != 0 && dy != 0 && df * dx > 0 && dr * dy > 0 && abs(df) == abs(dr) && abs(df) <= 7) {
+                int k = abs(df);
+                int moveType = d * 7 + (k - 1);
+                return file * 8 * 73 + rank * 73 + moveType;
+            }
+        }
+
+        // Not one of the 73 types
+        return UINT32_MAX;
     }
 
     std::string decode(std::uint32_t action) {
@@ -95,54 +113,6 @@ namespace az73 {
         uci.push_back('a' + tf); uci.push_back('1' + tr);
         if (promo) uci.push_back(promo);
         return uci;
-    }
-
-    std::uint32_t from_uci(std::string_view u) {
-        if (u.size() != 4 && u.size() != 5)
-            throw std::invalid_argument("UCI must be 4 or 5 chars");
-
-        int ff = u[0] - 'a', fr = u[1] - '1';
-        int tf = u[2] - 'a', tr = u[3] - '1';
-        if (!detail::on_board(ff, fr) || !detail::on_board(tf, tr))
-            throw std::invalid_argument("coords off board");
-
-        int df = tf - ff, dr = tr - fr, fromIdx = fr * 8 + ff;
-
-        if (u.size() == 5 && (u[4] == 'n' || u[4] == 'N' || u[4] == 'b' || u[4] == 'B' || u[4] == 'r' || u[4] == 'R')) {
-            int pidx = (std::tolower(u[4]) == 'n') ? 0 : (std::tolower(u[4]) == 'b' ? 1 : 2);
-            int dir_idx;
-            if (dr == 1) dir_idx = (df == -1 ? 0 : df == 0 ? 1 : 2);
-            else if (dr == -1) dir_idx = (df == 1 ? 0 : df == 0 ? 1 : 2);
-            else throw std::invalid_argument("promo delta bad");
-            return fromIdx * 73u + 64u + pidx * 3 + dir_idx;
-        }
-
-        if ((std::abs(df) == 1 && std::abs(dr) == 2) || (std::abs(df) == 2 && std::abs(dr) == 1)) {
-            const int offset = dr * 8 + df;
-            for (int i = 0; i < 8; ++i)
-                if (detail::KNIGHT[i] == offset)
-                    return fromIdx * 73u + 56u + i;
-            throw std::logic_error("from_uci: knight offset mismatch");
-        }
-
-        const bool diag = std::abs(df) == std::abs(dr) && df != 0;
-        const bool horiz = dr == 0 && df != 0;
-        const bool vert = df == 0 && dr != 0;
-        if (!diag && !horiz && !vert)
-            throw std::invalid_argument("displacement not queen-like");
-
-        int dir = -1, dist;
-        if (vert) dir = dr > 0 ? 0 : 4, dist = std::abs(dr);
-        else if (horiz) dir = df > 0 ? 2 : 6, dist = std::abs(df);
-        else {
-            if (df > 0 && dr > 0) dir = 1;
-            else if (df > 0 && dr < 0) dir = 3;
-            else if (df < 0 && dr < 0) dir = 5;
-            else dir = 7;
-            dist = std::abs(df);
-        }
-
-        return fromIdx * 73u + dir * 7u + (dist - 1);
     }
 
 } // namespace az73
@@ -247,16 +217,21 @@ ChessGame::Tensor ChessGame::encodeTensor() const {
 }
 
 std::vector<std::uint32_t> ChessGame::legalMoves() const {
-    chess::Movelist mvlist;
-    chess::movegen::legalmoves(mvlist, currentBoard());
 
-    std::vector<std::uint32_t> out;
-    out.reserve(mvlist.size());
-    for (const auto& mv : mvlist)
-        out.push_back(az73::encode(mv));
+    using namespace chess;
+    Movelist movelist;
+    // Generate all legal moves for the current position
+    movegen::legalmoves<movegen::MoveGenType::ALL>(movelist, currentBoard(), 
+            PieceGenType::PAWN | PieceGenType::KNIGHT | PieceGenType::BISHOP |
+            PieceGenType::ROOK | PieceGenType::QUEEN  | PieceGenType::KING);
 
-    std::sort(out.begin(), out.end());
-    return out;
+    std::vector<std::uint32_t> actions;
+    actions.reserve(static_cast<size_t>(movelist.size()));
+    for (const auto& mv : movelist) {
+        std::uint32_t a = az73::encode(currentBoard(), mv);
+        if (a < 4672) actions.push_back(a);
+    }
+    return actions;
 }
 
 std::string ChessGame::actionToUci(std::uint32_t a) const {
