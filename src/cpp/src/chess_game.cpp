@@ -3,61 +3,50 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <numeric> // std::count
+#include <numeric>
 
 namespace az73 {
-    static constexpr std::array<std::pair<int,int>,8> DIRECTIONS = {{
-        {0, 1}, {1, 1}, {1, 0}, {1, -1}, {0, -1}, {-1, -1}, {-1, 0}, {-1, 1}
-    }};
-    // Knight move deltas in clockwise order
-    static constexpr std::array<std::pair<int,int>,8> KNIGHT_DELTAS = {{
-        {1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}
-    }};
+    namespace {
+        static constexpr std::array<std::pair<int, int>, 8> DIRECTIONS = {{{0, 1}, {1, 1}, {1, 0}, {1, -1}, {0, -1}, {-1, -1}, {-1, 0}, {-1, 1}}};
+        static constexpr std::array<std::pair<int, int>, 8> KNIGHT_DELTAS = {{{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}}};
+        static constexpr std::array<int, 3> UNDERPROMO_DF{{-1, 0, 1}};
+    }
 
     std::uint32_t encode(const chess::Board& board, const chess::Move& mv) {
-
         using namespace chess;
-        // Determine perspective
         const Color toPlay = board.sideToMove();
-        // True squares
         const Square trueFrom = mv.from();
-        const Square trueTo   = mv.to();
-        // Mirror for Black
+        const Square trueTo = mv.to();
         const Square fromSq = trueFrom.relative_square(toPlay);
-        const Square toSq   = trueTo.relative_square(toPlay);
-
+        const Square toSq = trueTo.relative_square(toPlay);
         const int file = fromSq.file();
         const int rank = fromSq.rank();
-        const int df   = toSq.file() - file;
-        const int dr   = toSq.rank() - rank;
+        const int df = toSq.file() - file;
+        const int dr = toSq.rank() - rank;
 
-        // Underpromotions (excluding queen)
         if (mv.typeOf() == chess::Move::PROMOTION && mv.promotionType() != chess::PieceType::QUEEN) {
-            int p    = static_cast<int>(mv.promotionType());        // underlying: KNIGHT=1, BISHOP=2, ROOK=3, QUEEN=4
-            int piece_idx = p - static_cast<int>(chess::PieceType::KNIGHT); // 0,1,2
+            int p = static_cast<int>(mv.promotionType());
+            int piece_idx = p - static_cast<int>(chess::PieceType::KNIGHT);
             if (abs(df) <= 1 && dr == 1) {
                 int dir = (df == -1 ? 0 : df == 0 ? 1 : 2);
-                int moveType = 64 + piece_idx * 3 + dir;  // 64..72
+                int moveType = 64 + piece_idx * 3 + dir;
                 return file * 8 * 73 + rank * 73 + moveType;
             }
             return UINT32_MAX;
         }
 
-        // Knight moves
         if (board.at(trueFrom).type() == chess::PieceType::KNIGHT) {
             auto it = std::find(KNIGHT_DELTAS.begin(), KNIGHT_DELTAS.end(), std::make_pair(df, dr));
             if (it != KNIGHT_DELTAS.end()) {
                 int idx = static_cast<int>(std::distance(KNIGHT_DELTAS.begin(), it));
-                int moveType = 56 + idx;  // 56..63
+                int moveType = 56 + idx;
                 return file * 8 * 73 + rank * 73 + moveType;
             }
             return UINT32_MAX;
         }
 
-        // Sliding (queen) moves
         for (int d = 0; d < 8; ++d) {
             auto [dx, dy] = DIRECTIONS[d];
-            // Check alignment and step
             if (dx == 0 && df == 0 && dr * dy > 0 && abs(dr) <= 7) {
                 int k = abs(dr);
                 int moveType = d * 7 + (k - 1);
@@ -72,71 +61,64 @@ namespace az73 {
                 return file * 8 * 73 + rank * 73 + moveType;
             }
         }
-
-        // Not one of the 73 types
         return UINT32_MAX;
     }
 
-    std::string decode(std::uint32_t action) {
-        const int fromIdx = static_cast<int>(action / 73);
-        const int slot = static_cast<int>(action % 73);
-        const int ff = detail::file(fromIdx);
-        const int fr = detail::rank(fromIdx);
-        int tf = ff, tr = fr;
-        char promo = 0;
+    chess::Move decode_action(std::uint32_t action, const chess::Board& board) {
+        constexpr int TOTAL = 8 * 8 * 73;
+        assert(action < TOTAL);
+        int mt = action % 73;
+        int tmp = action / 73;
+        int file = tmp / 8;
+        int rank = tmp % 8;
+        if (board.sideToMove() == chess::Color::BLACK) rank = 7 - rank;
+        chess::Square from(chess::File(static_cast<chess::File::underlying>(file)), chess::Rank(static_cast<chess::Rank::underlying>(rank)));
 
-        if (slot < 56) {
-            const int dir = slot / 7;
-            const int dist = (slot % 7) + 1;
-            int dest = fromIdx + detail::DIR[dir] * dist;
-            tf = detail::file(dest); tr = detail::rank(dest);
-        } else if (slot < 64) {
-            const int k = slot - 56;
-            int dest = fromIdx + detail::KNIGHT[k];
-            tf = detail::file(dest); tr = detail::rank(dest);
+        if (mt < 56) {
+            int dir = mt / 7;
+            int step = (mt % 7) + 1;
+            auto [df, dr] = DIRECTIONS[dir];
+            if (board.sideToMove() == chess::Color::BLACK) dr = -dr;
+            int tf = file + df * step;
+            int tr = rank + dr * step;
+            chess::Square to(chess::File(static_cast<chess::File::underlying>(tf)), chess::Rank(static_cast<chess::Rank::underlying>(tr)));
+            return chess::Move::make<chess::Move::NORMAL>(from, to);
+        } else if (mt < 64) {
+            int idx = mt - 56;
+            auto [df, dr] = KNIGHT_DELTAS[idx];
+            if (board.sideToMove() == chess::Color::BLACK) dr = -dr;
+            int tf = file + df;
+            int tr = rank + dr;
+            chess::Square to(chess::File(static_cast<chess::File::underlying>(tf)), chess::Rank(static_cast<chess::Rank::underlying>(tr)));
+            return chess::Move::make<chess::Move::NORMAL>(from, to);
         } else {
-            int local = slot - 64;
-            int pidx = local / 3;
-            int dir_idx = local % 3;
-            promo = detail::PROMO[pidx];
-            bool white = (fr == 6);
-            int df = (dir_idx == 0 ? -1 : dir_idx == 2 ? 1 : 0) * (white ? 1 : -1);
-            tf = ff + df;
-            tr = fr + (white ? 1 : -1);
+            int promo_idx = (mt - 64) / 3;
+            int dir_idx = (mt - 64) % 3;
+            int df = UNDERPROMO_DF[dir_idx];
+            int dr = (board.sideToMove() == chess::Color::WHITE ? 1 : -1);
+            int tf = file + df;
+            int promo_rank = (board.sideToMove() == chess::Color::WHITE ? 7 : 0);
+            chess::Square to(chess::File(static_cast<chess::File::underlying>(tf)), chess::Rank(static_cast<chess::Rank::underlying>(promo_rank)));
+            chess::PieceType pt = (promo_idx == 0 ? chess::PieceType::KNIGHT : promo_idx == 1 ? chess::PieceType::BISHOP : chess::PieceType::ROOK);
+            return chess::Move::make<chess::Move::PROMOTION>(from, to, pt);
         }
-
-        if (!detail::on_board(tf, tr)) throw std::logic_error("decode: off-board result");
-
-        std::string uci;
-        uci.reserve(5);
-        uci.push_back('a' + ff); uci.push_back('1' + fr);
-        uci.push_back('a' + tf); uci.push_back('1' + tr);
-        if (promo) uci.push_back(promo);
-        return uci;
     }
-
 } // namespace az73
 
 namespace {
-
     using chess::Color;
     using chess::PieceType;
     using chess::Square;
     using chess::Bitboard;
 
     constexpr int flat(int plane, int r, int f) { return plane * 64 + r * 8 + f; }
-
-    inline void fill(float* base, int plane, float v) noexcept {
-        std::fill(base + plane * 64, base + (plane + 1) * 64, v);
-    }
-
+    inline void fill(float* base, int plane, float v) noexcept { std::fill(base + plane * 64, base + (plane + 1) * 64, v); }
     inline std::pair<int, int> orient(Square sq, Color view) {
         int r = static_cast<int>(sq.rank());
         int f = static_cast<int>(sq.file());
         if (view == Color::BLACK) { r = 7 - r; f = 7 - f; }
         return {r, f};
     }
-
 } // anonymous namespace
 
 ChessGame::ChessGame(std::string_view fen) {
@@ -154,7 +136,6 @@ void ChessGame::makeMove(const chess::Move& m) {
 ChessGame::Tensor ChessGame::encodeTensor() const {
     constexpr int PLANES_PER_STEP = 14;
     Tensor x{};
-
     const chess::Board& cur = history_.back();
     const Color P1 = cur.sideToMove();
     const Color P2 = (P1 == Color::WHITE ? Color::BLACK : Color::WHITE);
@@ -162,7 +143,6 @@ ChessGame::Tensor ChessGame::encodeTensor() const {
     for (int t = 0; t < 8; ++t) {
         int hIdx = static_cast<int>(history_.size()) - 1 - t;
         if (hIdx < 0) break;
-
         const chess::Board& b = history_[hIdx];
         const bool flip = (b.sideToMove() != P1);
         const Color view = flip ? P2 : P1;
@@ -192,7 +172,6 @@ ChessGame::Tensor ChessGame::encodeTensor() const {
     }
 
     constexpr int CONST0 = 8 * PLANES_PER_STEP;
-
     fill(x.data(), CONST0 + 0, (P1 == Color::WHITE) ? 1.0f : 0.0f);
     fill(x.data(), CONST0 + 1, static_cast<float>(cur.fullMoveNumber()));
 
@@ -217,14 +196,9 @@ ChessGame::Tensor ChessGame::encodeTensor() const {
 }
 
 std::vector<std::uint32_t> ChessGame::legalMoves() const {
-
     using namespace chess;
     Movelist movelist;
-    // Generate all legal moves for the current position
-    movegen::legalmoves<movegen::MoveGenType::ALL>(movelist, currentBoard(), 
-            PieceGenType::PAWN | PieceGenType::KNIGHT | PieceGenType::BISHOP |
-            PieceGenType::ROOK | PieceGenType::QUEEN  | PieceGenType::KING);
-
+    movegen::legalmoves<movegen::MoveGenType::ALL>(movelist, currentBoard(), PieceGenType::PAWN | PieceGenType::KNIGHT | PieceGenType::BISHOP | PieceGenType::ROOK | PieceGenType::QUEEN | PieceGenType::KING);
     std::vector<std::uint32_t> actions;
     actions.reserve(static_cast<size_t>(movelist.size()));
     for (const auto& mv : movelist) {
@@ -232,12 +206,4 @@ std::vector<std::uint32_t> ChessGame::legalMoves() const {
         if (a < 4672) actions.push_back(a);
     }
     return actions;
-}
-
-std::string ChessGame::actionToUci(std::uint32_t a) const {
-    return az73::decode(a);
-}
-
-std::uint32_t ChessGame::uciToAction(std::string_view u) const {
-    return az73::from_uci(u);
 }
