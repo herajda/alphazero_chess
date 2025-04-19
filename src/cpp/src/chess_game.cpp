@@ -127,10 +127,14 @@ ChessGame::ChessGame(std::string_view fen) {
 }
 
 void ChessGame::makeMove(const chess::Move& m) {
-    chess::Board b = history_.back();
+    chess::Board b = currentBoard();
     b.makeMove(m);
     history_.push_back(b);
     hashes_.push_back(b.hash());
+}
+void ChessGame::makeMove(const std::uint32_t a) {
+    chess::Move m = az73::decode_action(a, currentBoard());
+    makeMove(m); 
 }
 
 ChessGame::Tensor ChessGame::encodeTensor() const {
@@ -207,3 +211,4 @@ std::vector<std::uint32_t> ChessGame::legalMoves() const {
     }
     return actions;
 }
+

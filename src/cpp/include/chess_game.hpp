@@ -22,7 +22,7 @@ public:
 
     [[nodiscard]] const chess::Board& currentBoard() const noexcept { return history_.back(); }
     void makeMove(const chess::Move& m);
-    void makeMove(const std::uint32_t& m);
+    void makeMove(const std::uint32_t m);
     [[nodiscard]] Tensor encodeTensor() const;
     [[nodiscard]] std::vector<std::uint32_t> legalMoves() const;
 
