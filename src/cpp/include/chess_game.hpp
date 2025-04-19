@@ -26,6 +26,9 @@ public:
     [[nodiscard]] Tensor encodeTensor() const;
     [[nodiscard]] std::vector<std::uint16_t> legalMoves() const;
 
+    [[nodiscard]] std::optional<int> winner() const;
+    [[nodiscard]] int to_play() const noexcept;
+
 private:
     std::vector<chess::Board> history_;
     std::vector<std::uint64_t> hashes_;

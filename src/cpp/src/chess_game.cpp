@@ -220,3 +220,36 @@ std::vector<std::uint16_t> ChessGame::legalMoves() const {
     return actions;
 }
 
+std::optional<int> ChessGame::winner() const {
+    const auto& b = currentBoard();
+    using namespace chess;
+
+    // Draw by 50-move rule
+    if (b.isHalfMoveDraw()) {
+        return -1;
+    }
+    // Draw by repetition
+    if (b.isRepetition()) {
+        return -1;
+    }
+    // Generate legal moves
+    Movelist movelist;
+    movegen::legalmoves<movegen::MoveGenType::ALL>(movelist, b, PieceGenType::PAWN | PieceGenType::KNIGHT | PieceGenType::BISHOP | PieceGenType::ROOK | PieceGenType::QUEEN | PieceGenType::KING);
+    if (movelist.empty()) {
+        // Check for checkmate vs stalemate
+        // If in check, side to move is mated
+        if (b.inCheck()) {
+            // opponent wins
+            return (b.sideToMove() == Color::WHITE) ? 0 : 1;
+        } else {
+            // stalemate
+            return -1;
+        }
+    }
+    // Game is ongoing
+    return std::nullopt;
+}
+
+int ChessGame::to_play() const noexcept {
+    return (currentBoard().sideToMove() == chess::Color::WHITE) ? 1 : 0;
+}
