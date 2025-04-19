@@ -7,12 +7,13 @@
 
 namespace az73 {
     namespace {
+
         static constexpr std::array<std::pair<int, int>, 8> DIRECTIONS = {{{0, 1}, {1, 1}, {1, 0}, {1, -1}, {0, -1}, {-1, -1}, {-1, 0}, {-1, 1}}};
         static constexpr std::array<std::pair<int, int>, 8> KNIGHT_DELTAS = {{{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}}};
         static constexpr std::array<int, 3> UNDERPROMO_DF{{-1, 0, 1}};
     }
 
-    std::uint32_t encode(const chess::Board& board, const chess::Move& mv) {
+    std::uint16_t encode(const chess::Board& board, const chess::Move& mv) {
         using namespace chess;
         const Color toPlay = board.sideToMove();
         const Square trueFrom = mv.from();
@@ -32,7 +33,7 @@ namespace az73 {
                 int moveType = 64 + piece_idx * 3 + dir;
                 return file * 8 * 73 + rank * 73 + moveType;
             }
-            return UINT32_MAX;
+            return UINT16_MAX;
         }
 
         if (board.at(trueFrom).type() == chess::PieceType::KNIGHT) {
@@ -42,7 +43,7 @@ namespace az73 {
                 int moveType = 56 + idx;
                 return file * 8 * 73 + rank * 73 + moveType;
             }
-            return UINT32_MAX;
+            return UINT16_MAX;
         }
 
         for (int d = 0; d < 8; ++d) {
@@ -61,10 +62,10 @@ namespace az73 {
                 return file * 8 * 73 + rank * 73 + moveType;
             }
         }
-        return UINT32_MAX;
+        return UINT16_MAX;
     }
 
-    chess::Move decode_action(std::uint32_t action, const chess::Board& board) {
+    chess::Move decode_action(std::uint16_t action, const chess::Board& board) {
         constexpr int TOTAL = 8 * 8 * 73;
         assert(action < TOTAL);
         int mt = action % 73;
@@ -82,6 +83,13 @@ namespace az73 {
             int tf = file + df * step;
             int tr = rank + dr * step;
             chess::Square to(chess::File(static_cast<chess::File::underlying>(tf)), chess::Rank(static_cast<chess::Rank::underlying>(tr)));
+            // Promotion check
+            if (board.at(from).type() == chess::PieceType::PAWN) {
+                // If a white pawn reaches rank 7, or a black pawn reaches rank 0, it's a queen‐promotion.
+                if (tr == (board.sideToMove() == chess::Color::WHITE ? 7 : 0)) {
+                    return chess::Move::make<chess::Move::PROMOTION>(from, to, chess::PieceType::QUEEN);
+                }
+            }
             return chess::Move::make<chess::Move::NORMAL>(from, to);
         } else if (mt < 64) {
             int idx = mt - 56;
@@ -132,7 +140,7 @@ void ChessGame::makeMove(const chess::Move& m) {
     history_.push_back(b);
     hashes_.push_back(b.hash());
 }
-void ChessGame::makeMove(const std::uint32_t a) {
+void ChessGame::makeMove(const std::uint16_t a) {
     chess::Move m = az73::decode_action(a, currentBoard());
     makeMove(m); 
 }
@@ -199,14 +207,14 @@ ChessGame::Tensor ChessGame::encodeTensor() const {
     return x;
 }
 
-std::vector<std::uint32_t> ChessGame::legalMoves() const {
+std::vector<std::uint16_t> ChessGame::legalMoves() const {
     using namespace chess;
     Movelist movelist;
     movegen::legalmoves<movegen::MoveGenType::ALL>(movelist, currentBoard(), PieceGenType::PAWN | PieceGenType::KNIGHT | PieceGenType::BISHOP | PieceGenType::ROOK | PieceGenType::QUEEN | PieceGenType::KING);
-    std::vector<std::uint32_t> actions;
+    std::vector<std::uint16_t> actions;
     actions.reserve(static_cast<size_t>(movelist.size()));
     for (const auto& mv : movelist) {
-        std::uint32_t a = az73::encode(currentBoard(), mv);
+        std::uint16_t a = az73::encode(currentBoard(), mv);
         if (a < 4672) actions.push_back(a);
     }
     return actions;
