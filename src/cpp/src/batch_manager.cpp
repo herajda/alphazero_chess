@@ -2,6 +2,7 @@
 #include <pybind11/numpy.h>
 #include <thread>
 #include <chrono>
+#include <iostream>
 
 namespace az73 {
 
@@ -48,9 +49,11 @@ void BatchManager::run_loop() {
         {
             std::unique_lock<std::mutex> lk(mtx_);
             // wait until we have at least one request or shutting down
+            //
             cv_.wait_for(lk, std::chrono::milliseconds(1), [&](){
                 return !queue_.empty() || !running_;
             });
+
             if (!running_ && queue_.empty())
                 break;
             // gather up to batch_size_ requests

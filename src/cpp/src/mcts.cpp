@@ -34,6 +34,7 @@ void MCTNode::expand() {
         total_value_  = v;
         return;
     }
+
     // Non-terminal: ask network
     auto tensor = game_.encodeTensor();
     std::vector<float> flat(tensor.begin(), tensor.end());

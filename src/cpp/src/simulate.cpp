@@ -17,7 +17,7 @@ AllGames simulate_games(py::object agent_py,
                         int sampling_moves) {
     // Initialize the BatchManager with the Python agent and batch size = num_threads
     BatchManager::instance().init(agent_py, num_threads);
-
+    py::gil_scoped_release no_gil;
     AllGames all_games;
     all_games.reserve(num_games);
     std::mutex mtx;
