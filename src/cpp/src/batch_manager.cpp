@@ -64,7 +64,7 @@ namespace az73 {
                 std::unique_lock<std::mutex> lk(mtx_);
                 // wait until we have at least one request or shutting down
                 //
-                cv_.wait_for(lk, std::chrono::milliseconds(1), [&](){
+                cv_.wait_for(lk, std::chrono::milliseconds(2), [&](){
                         return !queue_.empty() || !running_;
                         });
 
@@ -92,7 +92,7 @@ namespace az73 {
 
             input = input.to(device_);
             // Forward through TorchScript
-            auto start = high_resolution_clock::now();
+            //auto start = high_resolution_clock::now();
             torch::InferenceMode guard;
             auto outputs = module_.forward({input}).toTuple();
             //auto end = high_resolution_clock::now();

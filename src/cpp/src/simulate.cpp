@@ -52,7 +52,7 @@ AllGames simulate_games(const std::string& model_path,
                     action = dist(rng);
                 }
 
-                std::cout << "action " << chess::uci::moveToUci(az73::decode_action(action, game.currentBoard())) << " game: " << game.currentBoard().getFen() << std::endl;
+                //std::cout << "action " << chess::uci::moveToUci(az73::decode_action(action, game.currentBoard())) << " game: " << game.currentBoard().getFen() << std::endl;
                 traj.emplace_back(flat, policy, (float)game.to_play());
                 game.makeMove((uint16_t)action);
             }

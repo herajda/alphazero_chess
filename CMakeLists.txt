@@ -5,6 +5,7 @@ find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(TORCH_CUDA_ARCH_LIST "8.9")  
 
 # pull in the python headers so <Python.h> is found
 include_directories(${Python3_INCLUDE_DIRS})
@@ -31,6 +32,9 @@ target_link_libraries(chess_engine PRIVATE
     pybind11::embed      
     ${Python3_LIBRARIES} 
     ${TORCH_LIBRARIES})
+set_target_properties(chess_engine PROPERTIES
+    LINK_FLAGS "-static-libstdc++ -static-libgcc"
+)
 set_target_properties(chess_engine PROPERTIES
     PREFIX ""   # produce chess_engine.so
 

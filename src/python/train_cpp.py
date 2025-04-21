@@ -100,6 +100,7 @@ def main():
                 boards, policies, outcomes = map(np.array, zip(*samples))
                 # Convert to torch tensors
                 boards_tensor   = torch.tensor(boards, dtype=torch.float32)
+                boards_tensor = boards_tensor.view(-1, 8, 8, 119)
                 policies_tensor = torch.tensor(policies, dtype=torch.float32)
                 values_tensor   = torch.tensor(outcomes, dtype=torch.float32)
 
