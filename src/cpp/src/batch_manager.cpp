@@ -26,6 +26,9 @@ namespace az73 {
             std::lock_guard<std::mutex> lk(mtx_);
             // Load the serialized TorchScript module
             module_ = torch::jit::load(model_path);
+            module_.eval();
+            module_ = torch::jit::freeze(module_);
+            module_ = torch::jit::optimize_for_inference(module_);
             // Choose device: use CUDA if available, else CPU
             if (torch::cuda::is_available()) {
                 device_ = torch::kCUDA;
@@ -54,6 +57,7 @@ namespace az73 {
         }
 
     void BatchManager::run_loop() {
+        using namespace std::chrono;
         while (true) {
             std::vector<std::shared_ptr<EvalRequest>> batch;
             {
@@ -85,11 +89,17 @@ namespace az73 {
                         batch[i]->tensor.data(),
                         8 * 8 * 119 * sizeof(float));
             }
-            // Move channels to front and onto device
-            input = input.permute({0,3,1,2}).to(device_);
 
+            input = input.to(device_);
             // Forward through TorchScript
+            auto start = high_resolution_clock::now();
+            torch::InferenceMode guard;
             auto outputs = module_.forward({input}).toTuple();
+            //auto end = high_resolution_clock::now();
+        
+            //auto duration = duration_cast<nanoseconds>(end - start).count();
+            //std::cout << "Time taken: " << duration << " nanoseconds" << std::endl;
+
             at::Tensor pol_t = outputs->elements()[0].toTensor().to(torch::kCPU);
             at::Tensor val_t = outputs->elements()[1].toTensor().to(torch::kCPU);
             auto pol_acc = pol_t.accessor<float,2>();
