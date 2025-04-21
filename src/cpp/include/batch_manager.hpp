@@ -6,8 +6,7 @@
 #include <condition_variable>
 #include <future>
 #include <memory>
-
-#include <pybind11/embed.h>
+#include <torch/script.h>
 
 namespace az73 {
 
@@ -22,8 +21,8 @@ public:
     // Get the singleton instance
     static BatchManager& instance();
 
-    // Initialize with the Python Agent object and desired batch size
-    void init(pybind11::object agent_py, size_t batch_size);
+    // Initialize with the path to a TorchScript module and batch size
+    void init(const std::string& model_path, size_t batch_size);
 
     // Enqueue a flat tensor, return a future for {policy, value}
     std::future<std::pair<std::vector<float>, float>>
@@ -36,12 +35,14 @@ private:
     // Main loop that gathers requests and calls into Python
     void run_loop();
 
+
     std::mutex                               mtx_;
     std::condition_variable                  cv_;
     std::deque<std::shared_ptr<EvalRequest>> queue_;
     bool                                     running_{false};
     size_t                                   batch_size_{1};
-    pybind11::object                         agent_py_;
+    torch::jit::script::Module               module_;   // TorchScript graph
+    torch::Device                            device_{torch::kCPU};
 };
 
 } // namespace az73

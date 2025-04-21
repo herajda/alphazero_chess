@@ -4,12 +4,13 @@ train_cpp.py
 
 Self-play training script using the C++ `chess_engine.simulate_games` backend.
 """
+import chess_engine
 import argparse
 import collections
 import numpy as np
 import torch
 
-import chess_engine
+
 from chess_agent import Agent, ReplayBuffer, adjust_learning_rate
 
 
@@ -67,8 +68,12 @@ def main():
 
         # --- Self-play generation via C++ backend ---
         agent._model.eval()
+        # Export current model to TorchScript
+        ts_path = f"model_ts_{iteration}.pt"
+        import subprocess
+        subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
         games = chess_engine.simulate_games(
-            agent=agent,
+            ts_path,
             num_games=args.sim_games,
             num_threads=args.threads,
             num_simulations=args.num_simulations,

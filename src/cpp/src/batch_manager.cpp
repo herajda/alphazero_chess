@@ -1,109 +1,110 @@
 #include "batch_manager.hpp"
-#include <pybind11/numpy.h>
 #include <thread>
 #include <chrono>
 #include <iostream>
 
+#include <torch/torch.h>
+#include <torch/script.h>
+
 namespace az73 {
 
-BatchManager& BatchManager::instance() {
-    static BatchManager instance;
-    return instance;
-}
-
-BatchManager::~BatchManager() {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        running_ = false;
+    BatchManager& BatchManager::instance() {
+        static BatchManager instance;
+        return instance;
     }
-    cv_.notify_all();
-}
 
-void BatchManager::init(pybind11::object agent_py, size_t batch_size) {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        agent_py_   = std::move(agent_py);
-        batch_size_ = batch_size;
-        running_    = true;
-    }
-    // Start the runner thread
-    std::thread(&BatchManager::run_loop, this).detach();
-}
-
-std::future<std::pair<std::vector<float>, float>>
-BatchManager::enqueue(const std::vector<float>& flat_tensor) {
-    auto req = std::make_shared<EvalRequest>();
-    req->tensor = flat_tensor;
-    auto fut = req->promise.get_future();
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        queue_.push_back(req);
-    }
-    cv_.notify_one();
-    return fut;
-}
-
-void BatchManager::run_loop() {
-    while (true) {
-        std::vector<std::shared_ptr<EvalRequest>> batch;
+    BatchManager::~BatchManager() {
         {
-            std::unique_lock<std::mutex> lk(mtx_);
-            // wait until we have at least one request or shutting down
-            //
-            cv_.wait_for(lk, std::chrono::milliseconds(1), [&](){
-                return !queue_.empty() || !running_;
-            });
-
-            if (!running_ && queue_.empty())
-                break;
-            // gather up to batch_size_ requests
-            while (!queue_.empty() && batch.size() < batch_size_) {
-                batch.push_back(queue_.front());
-                queue_.pop_front();
-            }
+            std::lock_guard<std::mutex> lk(mtx_);
+            running_ = false;
         }
-        if (batch.empty()) continue;
+        cv_.notify_all();
+    }
 
-        // Acquire GIL for Python calls
-        pybind11::gil_scoped_acquire acquire;
-
-        // Build NumPy array of shape [B,8,8,119]
-        size_t B = batch.size();
-        std::vector<pybind11::ssize_t> shape = { (pybind11::ssize_t)B, 8, 8, 119 };
-        pybind11::array_t<float> input(shape);
-        auto buf = input.mutable_unchecked<4>();
-        for (size_t i = 0; i < B; ++i) {
-            auto const& flat = batch[i]->tensor;
-            for (size_t j = 0; j < flat.size(); ++j) {
-                size_t plane = j / 64;
-                size_t rem   = j % 64;
-                size_t r     = rem / 8;
-                size_t c     = rem % 8;
-                buf(i, r, c, plane) = flat[j];
+    void BatchManager::init(const std::string& model_path, size_t batch_size) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            // Load the serialized TorchScript module
+            module_ = torch::jit::load(model_path);
+            // Choose device: use CUDA if available, else CPU
+            if (torch::cuda::is_available()) {
+                device_ = torch::kCUDA;
+            } else {
+                device_ = torch::kCPU;
             }
+            module_.to(device_);
+            batch_size_ = batch_size;
+            running_    = true;
+        }
+        // Start the runner thread
+        std::thread(&BatchManager::run_loop, this).detach();
+    }
+
+    std::future<std::pair<std::vector<float>, float>>
+        BatchManager::enqueue(const std::vector<float>& flat_tensor) {
+            auto req = std::make_shared<EvalRequest>();
+            req->tensor = flat_tensor;
+            auto fut = req->promise.get_future();
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                queue_.push_back(req);
+            }
+            cv_.notify_one();
+            return fut;
         }
 
-        // Call Python: (policy, value) = agent_py_.predict(input)
-        auto result = agent_py_.attr("predict")(input).cast<pybind11::tuple>();
+    void BatchManager::run_loop() {
+        while (true) {
+            std::vector<std::shared_ptr<EvalRequest>> batch;
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                // wait until we have at least one request or shutting down
+                //
+                cv_.wait_for(lk, std::chrono::milliseconds(1), [&](){
+                        return !queue_.empty() || !running_;
+                        });
 
-        // element 0: policy array [B, A]
-        auto pol_array = result[0].cast<pybind11::array_t<float>>();
-        auto pol       = pol_array.unchecked<2>();  
+                if (!running_ && queue_.empty())
+                    break;
+                // gather up to batch_size_ requests
+                while (!queue_.empty() && batch.size() < batch_size_) {
+                    batch.push_back(queue_.front());
+                    queue_.pop_front();
+                }
+            }
+            if (batch.empty()) continue;
 
-        // element 1: value array  [B, 1]
-        auto val_array = result[1].cast<pybind11::array_t<float>>();
-        auto val       = val_array.unchecked<2>();
+            // Build a [B,8,8,119] CPU tensor then permute -> [B,119,8,8]
+            size_t B = batch.size();
+            std::vector<int64_t> dims = { (int64_t)B, 8, 8, 119 };
+            auto options = torch::TensorOptions().dtype(torch::kFloat32);
+            at::Tensor input = torch::empty(dims, options);
+            float* ptr = input.data_ptr<float>();
+            for (size_t i = 0; i < B; ++i) {
+                std::memcpy(ptr + i * 8 * 8 * 119,
+                        batch[i]->tensor.data(),
+                        8 * 8 * 119 * sizeof(float));
+            }
+            // Move channels to front and onto device
+            input = input.permute({0,3,1,2}).to(device_);
 
-        // Dispatch results to promises
-        for (size_t i = 0; i < B; ++i) {
-            size_t A = pol.shape(1);
-            std::vector<float> policy(A);
-            for (size_t a = 0; a < A; ++a)
-                policy[a] = pol(i, a);
-            float v = val(i, 0);
-            batch[i]->promise.set_value({std::move(policy), v});
+            // Forward through TorchScript
+            auto outputs = module_.forward({input}).toTuple();
+            at::Tensor pol_t = outputs->elements()[0].toTensor().to(torch::kCPU);
+            at::Tensor val_t = outputs->elements()[1].toTensor().to(torch::kCPU);
+            auto pol_acc = pol_t.accessor<float,2>();
+            auto val_acc = val_t.accessor<float,2>();
+
+            // Dispatch results to promises
+            for (size_t i = 0; i < B; ++i) {
+                size_t A = pol_acc.size(1);
+                std::vector<float> policy(A);
+                for (size_t a = 0; a < A; ++a)
+                    policy[a] = pol_acc[i][a];
+                float v = val_acc[i][0];
+                batch[i]->promise.set_value({std::move(policy), v});
+            }
         }
     }
-}
 
 } // namespace az73

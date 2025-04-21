@@ -1,5 +1,7 @@
 #include "simulate.hpp"
 #include "mcts.hpp"
+#include "chess.hpp"
+#include "chess_game.hpp"
 #include "batch_manager.hpp"
 #include <pybind11/stl.h>
 #include <thread>
@@ -8,15 +10,16 @@
 #include <random>
 
 namespace az73 {
-AllGames simulate_games(py::object agent_py,
+
+AllGames simulate_games(const std::string& model_path,
                         int num_games,
                         int num_threads,
                         int num_simulations,
                         double alpha,
                         double epsilon,
                         int sampling_moves) {
-    // Initialize the BatchManager with the Python agent and batch size = num_threads
-    BatchManager::instance().init(agent_py, num_threads);
+    // Initialize the BatchManager with a TorchScript model
+    BatchManager::instance().init(model_path, num_threads);
     py::gil_scoped_release no_gil;
     AllGames all_games;
     all_games.reserve(num_games);
@@ -49,6 +52,7 @@ AllGames simulate_games(py::object agent_py,
                     action = dist(rng);
                 }
 
+                std::cout << "action " << chess::uci::moveToUci(az73::decode_action(action, game.currentBoard())) << " game: " << game.currentBoard().getFen() << std::endl;
                 traj.emplace_back(flat, policy, (float)game.to_play());
                 game.makeMove((uint16_t)action);
             }
@@ -81,11 +85,10 @@ AllGames simulate_games(py::object agent_py,
 }
 
 } // namespace az73
-
 PYBIND11_MODULE(chess_engine, m) {
-    m.doc() = "C++ self-play simulator with batched Python inference";
+    m.doc() = "C++ self-play simulator with batched TorchScript inference";
     m.def("simulate_games", &az73::simulate_games,
-          py::arg("agent"), py::arg("num_games"), py::arg("num_threads"),
-          py::arg("num_simulations"), py::arg("alpha"), py::arg("epsilon"),
-          py::arg("sampling_moves"));
+          py::arg("model_path"), py::arg("num_games"),
+          py::arg("num_threads"), py::arg("num_simulations"),
+          py::arg("alpha"), py::arg("epsilon"), py::arg("sampling_moves"));
 }
