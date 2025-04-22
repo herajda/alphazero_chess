@@ -8,21 +8,22 @@
 #include <mutex>
 #include <algorithm>
 #include <random>
+#include <fstream>
 
 namespace az73 {
-
-AllGames simulate_games(const std::string& model_path,
+void simulate_games_dump(const std::string& model_path,
                         int num_games,
                         int num_threads,
                         int num_simulations,
                         double alpha,
                         double epsilon,
-                        int sampling_moves) {
+                        int sampling_moves,
+			const std::string &output_file) {
     // Initialize the BatchManager with a TorchScript model
     BatchManager::instance().init(model_path, num_threads);
     py::gil_scoped_release no_gil;
-    AllGames all_games;
-    all_games.reserve(num_games);
+    std::ofstream out(output_file, std::ios::binary | std::ios::app);
+    std::mutex file_mtx;
     std::mutex mtx;
 
     auto worker = [&](int count) {
@@ -52,7 +53,7 @@ AllGames simulate_games(const std::string& model_path,
                     action = dist(rng);
                 }
 
-                //std::cout << "action " << chess::uci::moveToUci(az73::decode_action(action, game.currentBoard())) << " game: " << game.currentBoard().getFen() << std::endl;
+                std::cout << "action " << chess::uci::moveToUci(az73::decode_action(action, game.currentBoard())) << " game: " << game.currentBoard().getFen() << std::endl;
                 traj.emplace_back(flat, policy, (float)game.to_play());
                 game.makeMove((uint16_t)action);
             }
@@ -67,8 +68,33 @@ AllGames simulate_games(const std::string& model_path,
                 std::get<2>(e) = z;
             }
 
-            std::lock_guard<std::mutex> lk(mtx);
-            all_games.push_back(std::move(traj));
+	    // **dump to disk** and free memory
+            {
+                std::lock_guard<std::mutex> lk(file_mtx);
+                int32_t steps = static_cast<int32_t>(traj.size());
+                out.write(reinterpret_cast<const char*>(&steps), sizeof(steps));
+
+                for (auto &e : traj) {
+                    auto &state  = std::get<0>(e);
+                    auto &policy = std::get<1>(e);
+                    float  z      = std::get<2>(e);
+
+                    // 1) write flat state (8*8*119 floats)
+                    out.write(reinterpret_cast<const char*>(state.data()),
+                              state.size() * sizeof(float));
+
+                    // 2) write policy length + data
+                    int32_t p_len = static_cast<int32_t>(policy.size());
+                    out.write(reinterpret_cast<const char*>(&p_len), sizeof(p_len));
+                    out.write(reinterpret_cast<const char*>(policy.data()),
+                              p_len * sizeof(float));
+
+                    // 3) write z
+                    out.write(reinterpret_cast<const char*>(&z), sizeof(z));
+                }
+            }
+            // drop traj out of RAM
+            std::vector<std::tuple<std::vector<float>,std::vector<float>,float>>().swap(traj);
         }
     };
 
@@ -81,14 +107,15 @@ AllGames simulate_games(const std::string& model_path,
         started += count;
     }
     for (auto& th : threads) th.join();
-    return all_games;
+    out.close();
 }
 
 } // namespace az73
 PYBIND11_MODULE(chess_engine, m) {
     m.doc() = "C++ self-play simulator with batched TorchScript inference";
-    m.def("simulate_games", &az73::simulate_games,
+    m.def("simulate_games_dump", &az73::simulate_games_dump,
           py::arg("model_path"), py::arg("num_games"),
           py::arg("num_threads"), py::arg("num_simulations"),
-          py::arg("alpha"), py::arg("epsilon"), py::arg("sampling_moves"));
+          py::arg("alpha"), py::arg("epsilon"), py::arg("sampling_moves"),
+          py::arg("output_file"));
 }

@@ -9,6 +9,7 @@ import argparse
 import collections
 import numpy as np
 import torch
+import os, struct
 
 
 from chess_agent import Agent, ReplayBuffer, adjust_learning_rate
@@ -25,7 +26,7 @@ def parse_args():
     parser.add_argument("--sampling_moves", type=int, default=3,
                         help="Number of moves to sample before switching to greedy.")
     parser.add_argument("--batch_size", type=int, default=32, help="Training batch size.")
-    parser.add_argument("--train_for", type=int, default=1, help="Training steps per iteration.")
+    parser.add_argument("--train_for", type=int, default=4, help="Training steps per iteration.")
     parser.add_argument("--window_length", type=int, default=100_000,
                         help="Replay buffer max length.")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Initial learning rate.")
@@ -44,6 +45,75 @@ def parse_args():
                         help="Path to save final model.")
     return parser.parse_args()
 
+GAMES_FILE = "games.bin"
+def load_games_from_file(path: str):
+    """Read every full trajectory dumped to `path`.  If we hit a short or
+    missing chunk at any point, stop and return what we've got."""
+    replays = []
+    if not os.path.exists(path):
+        return replays
+
+    with open(path, "rb") as f:
+        while True:
+            hdr = f.read(4)
+            if len(hdr) < 4:
+                # no more complete headers
+                break
+            steps, = struct.unpack("<i", hdr)
+
+            # read each step; bail out if any part is incomplete
+            failed = False
+            for _ in range(steps):
+                # 1) flat state
+                state_bytes = f.read(4 * 8 * 8 * 119)
+                if len(state_bytes) < 4 * 8 * 8 * 119:
+                    failed = True
+                    break
+                state = np.frombuffer(state_bytes, dtype=np.float32).reshape(8, 8, 119)
+
+                # 2) policy length
+                plen_bytes = f.read(4)
+                if len(plen_bytes) < 4:
+                    failed = True
+                    break
+                p_len, = struct.unpack("<i", plen_bytes)
+
+                policy_bytes = f.read(4 * p_len)
+                if len(policy_bytes) < 4 * p_len:
+                    failed = True
+                    break
+                policy = np.frombuffer(policy_bytes, dtype=np.float32)
+
+                # 3) z
+                z_bytes = f.read(4)
+                if len(z_bytes) < 4:
+                    failed = True
+                    break
+                z, = struct.unpack("<f", z_bytes)
+
+                replays.append((state, policy, z))
+
+            if failed:
+                # We encountered a truncated record—stop parsing further
+                break
+
+    # now clear the file (so we won't re‑read old or partial data next time)
+    with open(path, "wb"):
+        pass
+
+    return replays
+def simulate_and_dump(model_ts: str, sim_args, games_file: str = GAMES_FILE):
+    """Wrapper around the new C++ binding."""
+    chess_engine.simulate_games_dump(
+        model_ts,
+        num_games=sim_args.sim_games,
+        num_threads=sim_args.threads,
+        num_simulations=sim_args.num_simulations,
+        alpha=sim_args.alpha,
+        epsilon=sim_args.epsilon,
+        sampling_moves=sim_args.sampling_moves,
+        output_file=games_file,
+    )
 
 def main():
     args = parse_args()
@@ -61,6 +131,10 @@ def main():
 
     iteration = 0
     training = True
+    initial = load_games_from_file(GAMES_FILE)
+    if initial:
+        replay_buffer.extend(initial)
+        print(f"Loaded {len(initial)} positions from previous dump.")
 
     while training:
         iteration += 1
@@ -72,21 +146,15 @@ def main():
         ts_path = f"model_ts_{iteration}.pt"
         import subprocess
         subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
-        games = chess_engine.simulate_games(
-            ts_path,
-            num_games=args.sim_games,
-            num_threads=args.threads,
-            num_simulations=args.num_simulations,
-            alpha=args.alpha,
-            epsilon=args.epsilon,
-            sampling_moves=args.sampling_moves,
-        )
-        print(f"Generated {len(games)} games")
-
-        # Collect into replay buffer
-        for traj in games:
-            replay_buffer.extend(traj)
-        print(f"Replay buffer size: {len(replay_buffer)}")
+        # dump to disk, then load it immediately
+        simulate_and_dump(ts_path, args, GAMES_FILE)
+        new = load_games_from_file(GAMES_FILE)
+        if not new:
+            print("Warning: no games were dumped!")
+        else:
+            replay_buffer.extend(new)
+            print(f"Appended {len(new)} new positions from disk.")
+        
 
         # --- Training phase ---
         agent._model.train()
