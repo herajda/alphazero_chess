@@ -14,6 +14,10 @@ using Trajectory = std::vector<std::tuple<std::vector<float>, std::vector<float>
 
 namespace az73 {
 
+/**
+ * Buffered self‑play: run `num_games` games, and for each move immediately
+ * append (state, policy, z) into a fixed‑size on‑disk ring buffer.
+ */
 void simulate_games_buffered(
     const std::string &model_path,
     int num_games,
