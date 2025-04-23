@@ -238,7 +238,8 @@ class Agent:
         self.optimizer.step()
 
     def predict(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        boards = torch.from_numpy(boards).float()
+        if type(boards) is not torch.Tensor: 
+            boards = torch.from_numpy(boards).float()
         boards = boards.to(self.device)
         self._model.eval()
         with torch.no_grad():
