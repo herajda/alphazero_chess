@@ -127,15 +127,24 @@ void simulate_games_buffered(
                 auto tensor = game.encodeTensor();
                 std::vector<float> flat(tensor.begin(), tensor.end());
                 auto policy = run_mcts(game, args);
+                auto legal = game.legalMoves();
+
+                std::vector<float> masked(az73::ACTION_SPACE, 0.0f);
+                for (auto a : legal) masked[a] = policy[a];
+
+                float sum = std::accumulate(masked.begin(), masked.end(), 0.0f);
 
                 int action;
-                if ((int)states.size() >= sampling_moves) {
-                    action = std::distance(policy.begin(),
-                                           std::max_element(policy.begin(), policy.end()));
+                if (sum == 0.0f) {                       // fallback: uniform over legal
+                    std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
+                    action = legal[uni(rng)];
+                } else if ((int)states.size() >= sampling_moves) {
+                    action = std::distance(masked.begin(),
+                                           std::max_element(masked.begin(), masked.end()));
                 } else {
-                    std::discrete_distribution<int> dist(policy.begin(), policy.end());
+                    std::discrete_distribution<int> dist(masked.begin(), masked.end());
                     action = dist(rng);
-                }
+                } 
 
                 states .push_back(std::move(flat));
                 policies.push_back(policy);
