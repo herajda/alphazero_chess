@@ -13,9 +13,90 @@
 #include <random>
 #include <iostream>
 #include <filesystem>
+#include <atomic>
 
 namespace az73 {
+// --------------------------------------------------------------------
+// Evaluate vs random
+// --------------------------------------------------------------------
+std::tuple<int,int,int,int,int,int>
+evaluate_vs_random(
+    const std::string &model_path,
+    int num_games_per_color,
+    int num_threads,
+    int num_simulations,
+    double alpha,
+    double epsilon,
+    int sampling_moves
+) {
+    // 1) initialize model (batch size == num_threads)
+    BatchManager::instance().init(model_path, num_threads);
+    // release GIL while doing C++ work
+    py::gil_scoped_release no_gil;
 
+    // 2) counters
+    std::atomic<int> w_win{0}, w_loss{0}, w_draw{0};
+    std::atomic<int> b_win{0}, b_loss{0}, b_draw{0};
+
+    // Worker: each thread plays up to `per` White games and `per` Black games
+    auto worker = [&](int per_color) {
+        std::mt19937_64 rng{std::random_device{}()};
+        for (int color : {1, 0}) {  // 1 = White, 0 = Black
+            for (int i = 0; i < per_color; ++i) {
+                ChessGame game;
+                MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
+                // play until end
+                while (!game.winner().has_value()) {
+                    if (game.to_play() == color) {
+                        // our agent
+                        auto policy = run_mcts(game, args);
+                        auto legal = game.legalMoves();
+                        // pick best move (no noise/exploration)
+                        uint16_t best = legal.front();
+                        float best_p = policy[best];
+                        for (auto a : legal) {
+                            if (policy[a] > best_p) {
+                                best_p = policy[a];
+                                best = a;
+                            }
+                        }
+                        game.makeMove(best);
+                    } else {
+                        // random baseline
+                        auto legal = game.legalMoves();
+                        std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
+                        game.makeMove(legal[uni(rng)]);
+                    }
+                }
+                // record result
+                int outcome = *game.winner();  // 1=White,0=Black,-1=draw
+                if (color == 1) {  // we played White
+                    if (outcome == -1)      w_draw++;
+                    else if (outcome == 1)  w_win++;
+                    else                    w_loss++;
+                } else {          // we played Black
+                    if (outcome == -1)      b_draw++;
+                    else if (outcome == 0)  b_win++;
+                    else                    b_loss++;
+                }
+            }
+        }
+    };
+
+    // 3) launch threads
+    int per = (num_games_per_color + num_threads - 1) / num_threads;
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back(worker, per);
+    }
+    for (auto &th : threads) th.join();
+
+    // 4) return aggregated results
+    return { w_win.load(), w_loss.load(), w_draw.load(),
+             b_win.load(), b_loss.load(), b_draw.load() };
+}
+// --------------------------------------------------------------------
 // Number of floats per record: state (8x8x119) + policy (8x8x73) + z
 static constexpr uint64_t RECORD_FLOATS = 8ULL * 8 * 119 + 8ULL * 8 * 73 + 1;
 static constexpr uint64_t RECORD_BYTES = RECORD_FLOATS * sizeof(float);
@@ -162,4 +243,15 @@ PYBIND11_MODULE(chess_engine, m) {
         py::arg("sampling_moves"),
         py::arg("filename"),
         py::arg("replay_buffer_capacity"));
+    
+    m.def("evaluate_vs_random", &az73::evaluate_vs_random,
+          py::arg("model_path"),
+          py::arg("games_per_color"),
+          py::arg("num_threads"),
+          py::arg("num_simulations"),
+          py::arg("alpha"),
+          py::arg("epsilon"),
+          py::arg("sampling_moves"),
+          "Evaluate the AlphaZero agent vs a random agent, returning "
+          "(white_wins, white_losses, white_draws, black_wins, black_losses, black_draws).");
 }

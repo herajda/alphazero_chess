@@ -7,6 +7,7 @@ with on-disk circular replay buffer.
 """
 import argparse
 import os
+os.environ["MKL_THREADING_LAYER"] = "GNU"  
 import struct
 import random
 import subprocess
@@ -63,6 +64,7 @@ def parse_args():
     parser.add_argument("--threads", type=int, default=1, help="Number of C++ self-play threads (and inference batch).")
     parser.add_argument("--sim_games", type=int, default=1, help="Number of self-play games per iteration.")
     parser.add_argument("--num_simulations", type=int, default=100, help="MCTS simulations per move.")
+    parser.add_argument("--num_simulations_eval", type=int, default=100, help="MCTS simulations per move in the evaluation mode.")
     parser.add_argument("--alpha", type=float, default=0.3, help="Dirichlet alpha for root noise.")
     parser.add_argument("--epsilon", type=float, default=0.25, help="Exploration epsilon for root noise.")
     parser.add_argument("--sampling_moves", type=int, default=3, help="Number of moves to sample before switching to greedy.")
@@ -80,7 +82,20 @@ def parse_args():
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
     return parser.parse_args()
 
-
+def evaluate_model(agent, ts_path, num_games, num_threads, num_simulations_eval, alpha, epsilon, sampling_moves):
+    """Evaluate the model against a random player."""
+    w_win, w_loss, w_draw, b_win, b_loss, b_draw = chess_engine.evaluate_vs_random(
+        ts_path,
+        num_games,
+        num_threads,
+        num_simulations_eval,
+        alpha,
+        epsilon,
+        sampling_moves
+    )
+    print(f"As White: {w_win}W / {w_loss}L / {w_draw}D")
+    print(f"As Black: {b_win}W / {b_loss}L / {b_draw}D")
+    return w_win, w_loss, w_draw, b_win, b_loss, b_draw
 def main():
     args = parse_args()
 
@@ -100,6 +115,22 @@ def main():
 
     iteration = 0
     training = True
+
+    # evaluate the model before training
+    if args.resume_model:
+        print("Evaluating model before training...")
+        ts_path = f"model_ts_initial.pt"
+        subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
+        evaluate_model(
+            agent,
+            ts_path,
+            num_games=10,
+            num_threads=args.threads,
+            num_simulations_eval=args.num_simulations_eval,
+            alpha=args.alpha,
+            epsilon=args.epsilon,
+            sampling_moves=args.sampling_moves
+        )
 
     while training and iteration < args.max_iterations:
         iteration += 1
@@ -145,7 +176,16 @@ def main():
 
         # periodic evaluation placeholder
         if iteration % args.evaluate_each == 0:
-            print(f"[Eval] Placeholder for evaluation at iteration {iteration}")
+            evaluate_model(
+                agent,
+                ts_path,
+                num_games=10,
+                num_threads=args.threads,
+                num_simulations_eval=args.num_simulations_eval,
+                alpha=args.alpha,
+                epsilon=args.epsilon,
+                sampling_moves=args.sampling_moves
+            )
 
         # periodic checkpoint
         if iteration % args.checkpoint_interval == 0:
