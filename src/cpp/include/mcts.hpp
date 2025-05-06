@@ -21,14 +21,14 @@ struct MCTArgs {
 class MCTNode {
 public:
     MCTNode(float prior, const ChessGame& game);
-    float value() const;
-    bool is_expanded() const;
+    [[nodiscard]] float value() const;
+    [[nodiscard]] bool is_expanded() const;
     void expand();
     void add_exploration_noise(double epsilon, double alpha);
-    std::pair<uint16_t, MCTNode*> select_child();
+    [[nodiscard]] std::pair<uint16_t, MCTNode*> select_child();
     void update(float v);
-    const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& children() const;
-    int visit_count() const;
+    [[nodiscard]] const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& children() const;
+    [[nodiscard]] int visit_count() const;
 
 private:
     float prior_;
