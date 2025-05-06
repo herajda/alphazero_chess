@@ -32,7 +32,7 @@ def move_to_action(board, move):
             direction = {-1: 0, 0: 1, 1: 2}[delta_file]  # NW: 0, N: 1, NE: 2
             piece_idx = move.promotion - 2  # KNIGHT: 0, BISHOP: 1, ROOK: 2
             move_type_index = 64 + 3 * piece_idx + direction
-            return (from_file, from_rank, move_type_index)
+            return flatten_action(from_file, from_rank, move_type_index)
         return None
 
     # Knight moves
@@ -42,7 +42,7 @@ def move_to_action(board, move):
         if delta in KNIGHT_DELTAS:
             knight_idx = KNIGHT_DELTAS.index(delta)
             move_type_index = 56 + knight_idx
-            return (from_file, from_rank, move_type_index)
+            return flatten_action(from_file, from_rank, move_type_index)
         return None
 
     # Queen moves (sliding moves)
@@ -53,14 +53,14 @@ def move_to_action(board, move):
                 move_type_index = 0 * 7 + (k - 1)
             else:  # S
                 move_type_index = 4 * 7 + (k - 1)
-            return (from_file, from_rank, move_type_index)
+            return flatten_action(from_file, from_rank, move_type_index)
         elif dr == 0 and delta_rank == 0 and 1 <= abs(delta_file) <= 7:
             k = abs(delta_file)
             if delta_file > 0:  # E
                 move_type_index = 2 * 7 + (k - 1)
             else:  # W
                 move_type_index = 6 * 7 + (k - 1)
-            return (from_file, from_rank, move_type_index)
+            return flatten_action(from_file, from_rank, move_type_index)
         elif delta_file != 0 and delta_rank != 0 and abs(delta_file) == abs(delta_rank) and 1 <= abs(delta_file) <= 7:
             k = abs(delta_file)
             if delta_file > 0 and delta_rank > 0:  # NE
@@ -71,12 +71,16 @@ def move_to_action(board, move):
                 move_type_index = 5 * 7 + (k - 1)
             elif delta_file < 0 and delta_rank > 0:  # NW
                 move_type_index = 7 * 7 + (k - 1)
-            return (from_file, from_rank, move_type_index)
+            return flatten_action(from_file, from_rank, move_type_index)
     return None  # Not one of the 73 move types
 
 def legal_moves_to_array(board):
-    array = [uci_to_action(board, move.uci()) for move in board.legal_moves]
-    return array
+    actions = []
+    for mv in board.legal_moves:
+        idx = move_to_action(board, mv)
+        if idx is not None:
+            actions.append(idx)
+    return actions
 
 def uci_to_action(board, uci):
     """Convert UCI string to flattened action number (0–4671) or None if invalid."""
@@ -86,7 +90,7 @@ def uci_to_action(board, uci):
     action = move_to_action(board, move)
     if action:
         from_file, from_rank, move_type = action
-        return (from_file) * 8 * 73 + (from_rank) * 73 + move_type 
+        return flatten_action(from_file, from_rank, move_type)
     return None
 
 def action_to_uci(board, action):
@@ -166,7 +170,7 @@ def flatten_action(file, rank, move_type):
     """
     if not (0 <= file < 8 and 0 <= rank < 8 and 0 <= move_type < 73):
         return None
-    return file + 8 * rank + 64 * move_type
+    return file * 8 * 73 + rank * 73 + move_type
 
 def unflatten_action(action):
     """
