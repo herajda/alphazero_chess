@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <random>
 #include <iostream>
+#include <filesystem>
 
 namespace az73 {
 
@@ -52,23 +53,26 @@ void simulate_games_buffered(
     BatchManager::instance().init(model_path, num_threads);
     py::gil_scoped_release no_gil;
 
-    // 2) Open (or create) ring‑buffer file
+    // 2) Open (or create) ring-buffer file
     std::fstream f(filename, std::ios::in|std::ios::out|std::ios::binary);
     if (!f) {
         std::cerr << "[AZ] creating new buffer file\n";
-        f.open(filename, std::ios::out|std::ios::binary);
+        // (a) write the 24-byte header, then close
+        std::ofstream of(filename, std::ios::binary|std::ios::trunc);
         int64_t zero = 0;
-        // header: capacity, size=0, head=0
-        f.write(reinterpret_cast<char*>(&capacity), sizeof(capacity));
-        f.write(reinterpret_cast<char*>(&zero), sizeof(zero));
-        f.write(reinterpret_cast<char*>(&zero), sizeof(zero));
-        f.flush();
-        // preallocate
-        std::vector<char> blank(capacity * RECORD_BYTES, 0);
-        f.write(blank.data(), blank.size());
-        f.flush();
-        f.close();
-        // reopen for read/write
+        of.write(reinterpret_cast<const char*>(&capacity), sizeof(capacity));
+        of.write(reinterpret_cast<const char*>(&zero),     sizeof(zero));
+        of.write(reinterpret_cast<const char*>(&zero),     sizeof(zero));
+        of.close();
+
+        // (b) resize the file to HEADER_BYTES + capacity*RECORD_BYTES
+        //     (sparse on most filesystems, no huge in-RAM buffer needed)
+        std::filesystem::resize_file(
+            filename,
+            HEADER_BYTES + capacity * RECORD_BYTES
+        );
+
+        // (c) reopen for read/write
         f.open(filename, std::ios::in|std::ios::out|std::ios::binary);
     }
     std::cerr << "[AZ] buffer file opened\n";
@@ -114,49 +118,60 @@ void simulate_games_buffered(
     // 4) Worker threads
     auto worker = [&](int count) {
         thread_local std::mt19937_64 rng(std::random_device{}());
+        // allocate once, reuse for every game
+        std::vector<std::vector<float>> states;
+        std::vector<std::vector<float>> policies;
+        std::vector<float>              toplays;
+
         for (int i = 0; i < count; ++i) {
+            // start clean
+            states .clear();
+            policies.clear();
+            toplays .clear();
+            // if you want to force memory back to the allocator:
+            states .shrink_to_fit();
+            policies.shrink_to_fit();
+            toplays .shrink_to_fit();
+
             ChessGame game;
             MCTArgs args{num_simulations, alpha, epsilon, sampling_moves};
 
-            // accumulate each step then write
-            std::vector<std::vector<float>> states;
-            std::vector<std::vector<float>> policies;
-            std::vector<float>              toplays;
-
+            // play one game
             while (!game.winner().has_value()) {
                 auto tensor = game.encodeTensor();
                 std::vector<float> flat(tensor.begin(), tensor.end());
                 auto policy = run_mcts(game, args);
-                auto legal = game.legalMoves();
+                auto legal  = game.legalMoves();
 
                 std::vector<float> masked(az73::ACTION_SPACE, 0.0f);
                 for (auto a : legal) masked[a] = policy[a];
 
                 float sum = std::accumulate(masked.begin(), masked.end(), 0.0f);
-
                 int action;
-                if (sum == 0.0f) {                       // fallback: uniform over legal
+                if (sum == 0.0f) {
                     std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
                     action = legal[uni(rng)];
                 } else if ((int)states.size() >= sampling_moves) {
-                    action = std::distance(masked.begin(),
-                                           std::max_element(masked.begin(), masked.end()));
+                    action = int(std::distance(
+                        masked.begin(),
+                        std::max_element(masked.begin(), masked.end())));
                 } else {
                     std::discrete_distribution<int> dist(masked.begin(), masked.end());
                     action = dist(rng);
-                } 
+                }
 
                 states .push_back(std::move(flat));
                 policies.push_back(policy);
-                toplays.push_back((float)game.to_play());
+                toplays .push_back(float(game.to_play()));
 
-                game.makeMove((uint16_t)action);
+                game.makeMove(uint16_t(action));
             }
 
+            // write this game's trajectory
             int w = *game.winner();
             for (size_t k = 0; k < states.size(); ++k) {
                 float z = (w == -1 ? 0.0f
-                          : toplays[k] == (float)w ? 1.0f
+                          : toplays[k] == float(w) ? 1.0f
                                                    : -1.0f);
                 append_one(states[k], policies[k], z);
             }
