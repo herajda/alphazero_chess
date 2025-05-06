@@ -19,28 +19,32 @@ namespace az73 {
             running_ = false;
         }
         cv_.notify_all();
+        // wait for our runner thread to finish cleanly
+        if (runner_thread_.joinable())
+            runner_thread_.join();
     }
 
     void BatchManager::init(const std::string& model_path, size_t batch_size) {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            // Load the serialized TorchScript module
-            module_ = torch::jit::load(model_path);
-            module_.eval();
-            module_ = torch::jit::freeze(module_);
-            module_ = torch::jit::optimize_for_inference(module_);
-            // Choose device: use CUDA if available, else CPU
-            if (torch::cuda::is_available()) {
-                device_ = torch::kCUDA;
-            } else {
-                device_ = torch::kCPU;
-            }
-            module_.to(device_);
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (running_) {
+            // already up → just adjust batch size
             batch_size_ = batch_size;
-            running_    = true;
+            return;
         }
-        // Start the runner thread
-        std::thread(&BatchManager::run_loop, this).detach();
+
+        // first-time init:
+        module_ = torch::jit::load(model_path);
+        module_.eval();
+        module_ = torch::jit::freeze(module_);
+        module_ = torch::jit::optimize_for_inference(module_);
+        device_ = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+        module_.to(device_);
+
+        batch_size_ = batch_size;
+        running_    = true;
+
+        // spawn exactly one runner thread
+        runner_thread_ = std::thread(&BatchManager::run_loop, this);
     }
 
     std::future<std::pair<std::vector<float>, float>>

@@ -43,6 +43,7 @@ private:
     size_t                                   batch_size_{1};
     torch::jit::script::Module               module_;   // TorchScript graph
     torch::Device                            device_{torch::kCPU};
+    std::thread                              runner_thread_;
 };
 
 } // namespace az73
