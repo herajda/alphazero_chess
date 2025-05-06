@@ -22,7 +22,6 @@ bool MCTNode::is_expanded() const {
 }
 
 void MCTNode::expand() {
-    // Terminal?
     auto win = game_.winner();
     if (win.has_value()) {
         children_.clear();
@@ -32,17 +31,13 @@ void MCTNode::expand() {
         else if (w == game_.to_play()) v = 1.0f;
         else v = -1.0f;
         visit_count_ = 1;
-        total_value_  = v;
+        total_value_ = v;
         return;
     }
-
-    // Non-terminal: ask network
     auto tensor = game_.encodeTensor();
     std::vector<float> flat(tensor.begin(), tensor.end());
     auto fut = BatchManager::instance().enqueue(flat);
     auto [policy, v] = fut.get();
-
-    // Expand children
     auto legal = game_.legalMoves();
     children_.clear();
     for (uint16_t a : legal) {
@@ -51,13 +46,12 @@ void MCTNode::expand() {
         children_[a] = std::make_unique<MCTNode>(policy[a], next);
     }
     visit_count_ = 1;
-    total_value_  = v;
+    total_value_ = v;
 }
 
 void MCTNode::add_exploration_noise(double epsilon, double alpha) {
     size_t K = children_.size();
     if (K == 0) return;
-    // sample Dirichlet(K, alpha)
     std::gamma_distribution<double> gamma(alpha, 1.0);
     std::vector<double> noise(K);
     double sum = 0;
@@ -67,8 +61,6 @@ void MCTNode::add_exploration_noise(double epsilon, double alpha) {
     }
     if (sum <= 0) sum = 1;
     for (auto &n : noise) n /= sum;
-    
-    // apply to priors
     std::vector<double> new_p;
     new_p.reserve(K);
     size_t idx = 0;
@@ -122,7 +114,6 @@ std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
     MCTNode root(1.0f, root_game);
     root.expand();
     root.add_exploration_noise(args.epsilon, args.alpha);
-
     std::vector<MCTNode*> path;
     for (int i = 0; i < args.num_simulations; ++i) {
         MCTNode* node = &root;
