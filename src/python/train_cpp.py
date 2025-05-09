@@ -117,20 +117,20 @@ def main():
     training = True
 
     # evaluate the model before training
-    if args.resume_model:
-        print("Evaluating model before training...")
-        ts_path = f"model_ts_initial.pt"
-        subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
-        evaluate_model(
-            agent,
-            ts_path,
-            num_games=10,
-            num_threads=args.threads,
-            num_simulations_eval=args.num_simulations_eval,
-            alpha=args.alpha,
-            epsilon=args.epsilon,
-            sampling_moves=args.sampling_moves
-        )
+    #if args.resume_model:
+    #    print("Evaluating model before training...")
+    #    ts_path = f"model_ts_initial.pt"
+    #    subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
+    #    evaluate_model(
+    #        agent,
+    #        ts_path,
+    #        num_games=10,
+    #        num_threads=args.threads,
+    #        num_simulations_eval=args.num_simulations_eval,
+    #        alpha=args.alpha,
+    #        epsilon=args.epsilon,
+    #        sampling_moves=args.sampling_moves
+    #    )
 
     while training and iteration < args.max_iterations:
         iteration += 1

@@ -27,6 +27,12 @@ public:
     void add_exploration_noise(double epsilon, double alpha);
     [[nodiscard]] std::pair<uint16_t, MCTNode*> select_child();
     void update(float v);
+    const ChessGame& game() const noexcept { return game_; }
+    /* ---------- asynchronous helpers ---------- */
+    bool pending()   const noexcept { return pending_; }
+    void mark_pending() noexcept    { pending_ = true; }
+    /** finish expansion when the network output arrives */
+    void complete_expand(const std::vector<float>& policy, float v);
     [[nodiscard]] const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& children() const;
     [[nodiscard]] int visit_count() const;
 
@@ -37,6 +43,11 @@ private:
     ChessGame game_;
     std::unordered_map<uint16_t, std::unique_ptr<MCTNode>> children_;
     static thread_local std::mt19937_64 rng_;
+    /* ---- helper that turns raw π into safe child priors ---- */
+    static std::vector<float>
+    sanitise_priors(const std::vector<float>& policy,
+                    const std::vector<uint16_t>& legal);
+    bool pending_{false};
 };
 
 // Run MCTS from `root_game` under parameters in `args`, return policy vector [4672]

@@ -30,7 +30,8 @@ evaluate_vs_random(
     int sampling_moves
 ) {
     // 1) initialize model (batch size == num_threads)
-    BatchManager::instance().init(model_path, num_threads);
+    constexpr std::size_t GPU_BATCH = 256;
+    BatchManager::instance().init(model_path, GPU_BATCH);
     // release GIL while doing C++ work
     py::gil_scoped_release no_gil;
 
@@ -130,7 +131,8 @@ void simulate_games_buffered(
     std::cerr << "[AZ] simulate_games_buffered: model='" << model_path << "' -> buffer='" << filename << "' cap=" << capacity << "\n";
 
     // 1) Load model
-    BatchManager::instance().init(model_path, num_threads);
+    constexpr std::size_t GPU_BATCH = 256;
+    BatchManager::instance().init(model_path, GPU_BATCH);
     py::gil_scoped_release no_gil;
 
     // 2) Open (or create) ring-buffer file
