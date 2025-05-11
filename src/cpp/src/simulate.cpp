@@ -171,58 +171,68 @@ void simulate_games_buffered(
         std::cerr << "[AZ] new size=" << size << " new head=" << head << "\n";
     };
 
-    auto worker = [&](int count) {
-        thread_local std::mt19937_64 rng(std::random_device{}());
-        std::vector<std::vector<float>> states;
-        std::vector<std::vector<float>> policies;
-        std::vector<float> toplays;
-        for (int i = 0; i < count; ++i) {
-            states.clear();
-            policies.clear();
-            toplays.clear();
-            states.shrink_to_fit();
-            policies.shrink_to_fit();
-            toplays.shrink_to_fit();
-            ChessGame game;
-            MCTArgs args{num_simulations, alpha, epsilon, sampling_moves};
-            while (!game.winner().has_value()) {
-                auto tensor = game.encodeTensor();
-                std::vector<float> flat(tensor.begin(), tensor.end());
-                auto policy = run_mcts(game, args);
-                auto legal = game.legalMoves();
-                std::vector<float> masked(az73::ACTION_SPACE, 0.0f);
-                for (auto a : legal) masked[a] = policy[a];
-                float sum = std::accumulate(masked.begin(), masked.end(), 0.0f);
-                int action;
-                if (sum == 0.0f) {
-                    std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
-                    action = legal[uni(rng)];
-                } else if ((int)states.size() >= sampling_moves) {
-                    action = int(std::distance(masked.begin(), std::max_element(masked.begin(), masked.end())));
-                } else {
-                    std::discrete_distribution<int> dist(masked.begin(), masked.end());
-                    action = dist(rng);
-                }
-                states.push_back(std::move(flat));
-                policies.push_back(policy);
-                toplays.push_back(float(game.to_play()));
-                game.makeMove(uint16_t(action));
-            }
-            int w = *game.winner();
-            for (size_t k = 0; k < states.size(); ++k) {
-                float z = (w == -1 ? 0.0f : toplays[k] == float(w) ? 1.0f : -1.0f);
-                append_one(states[k], policies[k], z);
-            }
-        }
-    };
-
-    int per = (num_games + num_threads - 1) / num_threads;
-    int started = 0;
+    // --- dynamic, perfectly-balanced scheduling --------------------
+    std::atomic<int> game_idx{0};
     std::vector<std::thread> threads;
-    for (int t = 0; t < num_threads && started < num_games; ++t) {
-        int cnt = std::min(per, num_games - started);
-        threads.emplace_back(worker, cnt);
-        started += cnt;
+    threads.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            // each thread gets its own RNG
+            std::mt19937_64 rng{std::random_device{}()};
+
+            // grab one game at a time
+            while (true) {
+                int idx = game_idx.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= num_games)
+                    break;
+
+                // ----- simulate exactly one game -----
+                // (copy the body of 'worker' here, but for a single game)
+                std::vector<std::vector<float>> states;
+                std::vector<std::vector<float>> policies;
+                std::vector<float> toplays;
+
+                ChessGame game;
+                MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
+                while (!game.winner().has_value()) {
+                    auto tensor = game.encodeTensor();
+                    std::vector<float> flat(tensor.begin(), tensor.end());
+                    auto policy = run_mcts(game, args);
+                    auto legal = game.legalMoves();
+
+                    std::vector<float> masked(ACTION_SPACE, 0.0f);
+                    for (auto mv : legal) masked[mv] = policy[mv];
+                    float sum = std::accumulate(masked.begin(), masked.end(), 0.0f);
+
+                    int action;
+                    if (sum == 0.0f) {
+                        std::uniform_int_distribution<size_t> u(0, legal.size() - 1);
+                        action = legal[u(rng)];
+                    } else if ((int)states.size() >= sampling_moves) {
+                        action = int(std::distance(masked.begin(),
+                                                   std::max_element(masked.begin(), masked.end())));
+                    } else {
+                        std::discrete_distribution<int> d(masked.begin(), masked.end());
+                        action = d(rng);
+                    }
+
+                    states.push_back(std::move(flat));
+                    policies.push_back(std::move(policy));
+                    toplays.push_back(float(game.to_play()));
+                    game.makeMove(uint16_t(action));
+                }
+
+                int w = *game.winner();
+                for (size_t k = 0; k < states.size(); ++k) {
+                    float z = (w == -1 ? 0.0f
+                                : toplays[k] == float(w) ? 1.0f
+                                                         : -1.0f);
+                    append_one(states[k], policies[k], z);
+                }
+                // ----------------------------------------
+            }
+        });
     }
     for (auto &th : threads) th.join();
     f.close();
