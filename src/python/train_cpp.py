@@ -73,13 +73,14 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Initial learning rate.")
     parser.add_argument("--final_learning_rate", type=float, default=0.0001, help="Final learning rate after decay.")
     parser.add_argument("--weight_decay", type=float, default=0.001, help="AdamW weight decay.")
-    parser.add_argument("--total_decay_iterations", type=int, default=100, help="Iterations over which to linearly decay the learning rate.")
+    parser.add_argument("--total_decay_iterations", type=int, default=500, help="Iterations over which to linearly decay the learning rate.")
     parser.add_argument("--evaluate_each", type=int, default=1, help="Perform evaluation every N iterations.")
     parser.add_argument("--checkpoint_interval", type=int, default=50, help="Save model checkpoint every N iterations.")
     parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum number of training iterations.")
     parser.add_argument("--model_path", type=str, default="model.pt", help="Path to save final model.")
     parser.add_argument("--replay_buffer_capacity", type=int, default=100000, help="Max on-disk entries in ring buffer.")
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
+    parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
     return parser.parse_args()
 
 def evaluate_model(agent, ts_path, num_games, num_threads, num_simulations_eval, alpha, epsilon, sampling_moves):
@@ -131,8 +132,31 @@ def main():
             epsilon=args.epsilon,
             sampling_moves=args.sampling_moves
         )
+    if args.pretrain:
+        # pretraining 
+        agent._model.train()
+        adjust_learning_rate(agent.optimizer, iteration, args)
+
+        batch = sample_from_file("games.bin", args.batch_size)
+        if not batch:
+            print("No games to train on; skipping training")
+        else:
+            for _ in range(args.train_for):
+                boards, policies, zs = map(np.array, zip(*batch))
+                boards_tensor   = torch.tensor(boards,   dtype=torch.float32)
+                policies_tensor = torch.tensor(policies, dtype=torch.float32)
+                zs_tensor       = torch.tensor(zs,       dtype=torch.float32)
+                agent.train(boards_tensor, policies_tensor, zs_tensor)
+            print(f"Training step completed on batch of {len(batch)} entries")
+
+        # save model after each training phase
+        agent.save(args.model_path)
+        print(f"Saved model to {args.model_path}")
+    torch.cuda.empty_cache()
+
 
     while training and iteration < args.max_iterations:
+        torch.cuda.empty_cache()
         iteration += 1
         print(f"--- Iteration {iteration} ---")
 
@@ -153,6 +177,7 @@ def main():
             replay_buffer_capacity=args.replay_buffer_capacity
         )
         print("Generated self-play games into buffer.")
+        torch.cuda.empty_cache()
 
         # training phase
         agent._model.train()
@@ -173,6 +198,7 @@ def main():
         # save model after each training phase
         agent.save(args.model_path)
         print(f"Saved model to {args.model_path}")
+        torch.cuda.empty_cache()
 
         # periodic evaluation placeholder
         if iteration % args.evaluate_each == 0:
@@ -186,6 +212,7 @@ def main():
                 epsilon=args.epsilon,
                 sampling_moves=args.sampling_moves
             )
+            torch.cuda.empty_cache()
 
         # periodic checkpoint
         if iteration % args.checkpoint_interval == 0:
