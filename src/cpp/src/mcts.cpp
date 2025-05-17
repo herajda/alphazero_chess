@@ -109,12 +109,15 @@ const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& MCTNode::children(
 int MCTNode::visit_count() const {
     return visit_count_;
 }
+int MCTNode::total_value() const {
+    return total_value_;
+}
 
 std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
     MCTNode root(1.0f, root_game);
     root.expand();
     root.add_exploration_noise(args.epsilon, args.alpha);
-    std::vector<MCTNode*> path;
+    std::deque<MCTNode*> path;
     for (int i = 0; i < args.num_simulations; ++i) {
         MCTNode* node = &root;
         path.clear();
@@ -124,7 +127,7 @@ std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
             node = next;
         }
         if (!node->is_expanded()) node->expand();
-        float val = node->value();
+        float val = -node->total_value();
         for (auto it = path.rbegin(); it != path.rend(); ++it) {
             (*it)->update(val);
             val = -val;

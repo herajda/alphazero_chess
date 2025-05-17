@@ -29,6 +29,7 @@ public:
     void update(float v);
     [[nodiscard]] const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& children() const;
     [[nodiscard]] int visit_count() const;
+    [[nodiscard]] int total_value() const;
 
 private:
     float prior_;
