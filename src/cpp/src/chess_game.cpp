@@ -106,15 +106,15 @@ chess::Move decode_action(std::uint16_t action, const chess::Board &board) {
     if (fromPiece.type() == chess::PieceType::PAWN && to == board.enpassantSq()) {
         return chess::Move::make<chess::Move::ENPASSANT>(from, to);
     }
-    if (fromPiece.type() == chess::PieceType::PAWN) {
-        if (to.rank() == (board.sideToMove() == chess::Color::WHITE ? chess::Rank::RANK_8 : chess::Rank::RANK_1)) {
-            return chess::Move::make<chess::Move::PROMOTION>(from, to, chess::PieceType::QUEEN);
-        }
-    }
     if (mt >= 64) {
         int promo_idx = (mt - 64) / 3;
         chess::PieceType pt = promo_idx == 0 ? chess::PieceType::KNIGHT : promo_idx == 1 ? chess::PieceType::BISHOP : chess::PieceType::ROOK;
         return chess::Move::make<chess::Move::PROMOTION>(from, to, pt);
+    }
+    if (fromPiece.type() == chess::PieceType::PAWN) {
+        if (to.rank() == (board.sideToMove() == chess::Color::WHITE ? chess::Rank::RANK_8 : chess::Rank::RANK_1)) {
+            return chess::Move::make<chess::Move::PROMOTION>(from, to, chess::PieceType::QUEEN);
+        }
     }
     if (fromPiece.type() == chess::PieceType::KNIGHT || mt >= 56) {
         return chess::Move::make<chess::Move::NORMAL>(from, to);
