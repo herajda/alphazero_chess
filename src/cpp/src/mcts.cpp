@@ -22,32 +22,58 @@ bool MCTNode::is_expanded() const {
 }
 
 void MCTNode::expand() {
-    auto win = game_.winner();
-    if (win.has_value()) {
+    // --- 1) Check for terminal parent, unchanged from yours ---
+    if (auto win = game_.winner()) {
         children_.clear();
-        float v;
-        int w = win.value();
-        if (w == -1) v = 0.0f;
-        else if (w == game_.to_play()) v = 1.0f;
-        else v = -1.0f;
+        float v = (win.value() == -1 ? 0.0f
+                   : win.value() == game_.to_play() ? 1.0f
+                   : -1.0f);
         visit_count_ = 1;
         total_value_ = v;
         return;
     }
+
+    // --- 2) Get net policy + value ---
     auto tensor = game_.encodeTensor();
     std::vector<float> flat(tensor.begin(), tensor.end());
-    auto fut = BatchManager::instance().enqueue(flat);
-    auto [policy, v] = fut.get();
+    auto [policy, v] = BatchManager::instance()
+                          .enqueue(flat).get();
+
+    // --- 3) Build children & collect terminals ---
     auto legal = game_.legalMoves();
-    children_.clear();
-    for (uint16_t a : legal) {
+    std::vector<uint16_t> win_moves, lose_moves;
+    // stash the raw network priors so we can rescale later
+    std::unordered_map<uint16_t, float> orig_prior;
+    for (auto a : legal) {
         ChessGame next = game_;
         next.makeMove(a);
+
+        // store original
+        orig_prior[a] = policy[a];
         children_[a] = std::make_unique<MCTNode>(policy[a], next);
+
+        // detect terminal children
+        if (auto w = next.winner()) {
+            if (w.value() == game_.to_play())
+                win_moves.push_back(a);
+            // draws (w == -1) are ignored here
+        }
     }
+
+    // --- 4) Override the priors if we saw any wins or losses ---
+    if (!win_moves.empty()) {
+        // Case A: we have winning moves → uniform over those
+        float p = 1.0f / win_moves.size();
+        for (auto &kv : children_) kv.second->prior_ = 0.0f;
+        for (auto a : win_moves) children_[a]->prior_ = p;
+    }
+    // else: no wins *and* no losses → leave net priors untouched
+
+    // --- 5) Finish usual expand bookkeeping ---
     visit_count_ = 1;
     total_value_ = v;
 }
+
 
 void MCTNode::add_exploration_noise(double epsilon, double alpha) {
     size_t K = children_.size();
@@ -109,14 +135,14 @@ const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& MCTNode::children(
 int MCTNode::visit_count() const {
     return visit_count_;
 }
-int MCTNode::total_value() const {
+float MCTNode::total_value() const {
     return total_value_;
 }
 
 std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
     MCTNode root(1.0f, root_game);
     root.expand();
-    root.add_exploration_noise(args.epsilon, args.alpha);
+    //root.add_exploration_noise(args.epsilon, args.alpha);
     std::deque<MCTNode*> path;
     for (int i = 0; i < args.num_simulations; ++i) {
         MCTNode* node = &root;
@@ -127,12 +153,24 @@ std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
             node = next;
         }
         if (!node->is_expanded()) node->expand();
-        float val = -node->total_value();
+        float val = node->total_value();
         for (auto it = path.rbegin(); it != path.rend(); ++it) {
             (*it)->update(val);
             val = -val;
         }
     }
+    std::cout << "--- MCTS root children stats ---\n";
+    std::cout << "FEN: " << root.game_.currentBoard().getFen() << std::endl;
+    for (auto &kv : root.children()) {
+        uint16_t action = kv.first;
+        MCTNode* child = kv.second.get();
+        std::cout
+            << "Action " << action << " UCI: " << chess::uci::moveToUci(az73::decode_action(action, root.game_.currentBoard()))
+            << " | total_value = " << child->total_value()
+            << " | visits = "      << child->visit_count()
+            << "\n";
+    }
+    std::cout << "--------------------------------\n";
     std::vector<float> policy(ACTION_SPACE, 0.0f);
     float tot = 0;
     for (auto &kv : root.children()) tot += kv.second->visit_count();

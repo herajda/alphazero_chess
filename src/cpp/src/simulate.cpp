@@ -50,7 +50,20 @@ evaluate_vs_random(
                     if (game.to_play() == color) {
                         // our agent
                         auto policy = run_mcts(game, args);
+                        //for (size_t i = 0; i < policy.size(); ++i) {
+                        //    if (policy[i] != 0.0f) {
+                        //        std::cout << i << ": " << policy[i] << "\n";
+                        //    }
+                        //}
                         auto legal = game.legalMoves();
+                        //std::cout << "[";
+                        //for (size_t i = 0; i < legal.size(); ++i) {
+                        //    std::cout << legal[i];
+                        //    if (i + 1 != legal.size())
+                        //        std::cout << ", ";
+                        //}
+                        //std::cout << "]" << std::endl << std::endl;
+
                         // pick best move (no noise/exploration)
                         uint16_t best = legal.front();
                         float best_p = policy[best];
@@ -60,12 +73,16 @@ evaluate_vs_random(
                                 best = a;
                             }
                         }
+                        std::cout << "Best move: " << best << " (p=" << best_p << ") UCI: " 
+                        << chess::uci::moveToUci(az73::decode_action(best, game.currentBoard())) << std::endl;
                         game.makeMove(best);
                     } else {
                         // random baseline
                         auto legal = game.legalMoves();
                         std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
-                        game.makeMove(legal[uni(rng)]);
+                        size_t random_idx = uni(rng);
+                        std::cout << "Random move UCI: " << chess::uci::moveToUci(az73::decode_action(legal[random_idx], game.currentBoard())) << std::endl;
+                        game.makeMove(legal[random_idx]);
                     }
                 }
                 // record result

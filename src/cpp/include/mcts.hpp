@@ -29,13 +29,14 @@ public:
     void update(float v);
     [[nodiscard]] const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& children() const;
     [[nodiscard]] int visit_count() const;
-    [[nodiscard]] int total_value() const;
+    [[nodiscard]] float total_value() const;
+
+    ChessGame game_;
 
 private:
     float prior_;
     int visit_count_;
     float total_value_;
-    ChessGame game_;
     std::unordered_map<uint16_t, std::unique_ptr<MCTNode>> children_;
     static thread_local std::mt19937_64 rng_;
 };
