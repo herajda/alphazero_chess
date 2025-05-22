@@ -26,8 +26,8 @@ void MCTNode::expand() {
     if (auto win = game_.winner()) {
         children_.clear();
         float v = (win.value() == -1 ? 0.0f
-                   : win.value() == game_.to_play() ? 1.0f
-                   : -1.0f);
+                   : win.value() == game_.to_play() ? -1.0f
+                   : 1.0f);
         visit_count_ = 1;
         total_value_ = v;
         return;
@@ -39,10 +39,10 @@ void MCTNode::expand() {
     auto [policy, v] = BatchManager::instance()
                           .enqueue(flat).get();
 
-    // --- 3) Build children & collect terminals ---
+    //// --- 3) Build children & collect terminals ---
     auto legal = game_.legalMoves();
-    std::vector<uint16_t> win_moves, lose_moves;
-    // stash the raw network priors so we can rescale later
+    //std::vector<uint16_t> win_moves;
+    //// stash the raw network priors so we can rescale later
     std::unordered_map<uint16_t, float> orig_prior;
     for (auto a : legal) {
         ChessGame next = game_;
@@ -52,21 +52,21 @@ void MCTNode::expand() {
         orig_prior[a] = policy[a];
         children_[a] = std::make_unique<MCTNode>(policy[a], next);
 
-        // detect terminal children
-        if (auto w = next.winner()) {
-            if (w.value() == game_.to_play())
-                win_moves.push_back(a);
-            // draws (w == -1) are ignored here
-        }
+        //// detect terminal children
+        //if (auto w = next.winner()) {
+        //    if (w.value() != game_.to_play())
+        //        win_moves.push_back(a);
+        //    // draws (w == -1) are ignored here
+        //}
     }
 
-    // --- 4) Override the priors if we saw any wins or losses ---
-    if (!win_moves.empty()) {
-        // Case A: we have winning moves → uniform over those
-        float p = 1.0f / win_moves.size();
-        for (auto &kv : children_) kv.second->prior_ = 0.0f;
-        for (auto a : win_moves) children_[a]->prior_ = p;
-    }
+    //// --- 4) Override the priors if we saw any wins or losses ---
+    //if (!win_moves.empty()) {
+    //    // Case A: we have winning moves → uniform over those
+    //    float p = 1.0f / win_moves.size();
+    //    for (auto &kv : children_) kv.second->prior_ = 0.0f;
+    //    for (auto a : win_moves) children_[a]->prior_ = p;
+    //}
     // else: no wins *and* no losses → leave net priors untouched
 
     // --- 5) Finish usual expand bookkeeping ---
@@ -149,29 +149,40 @@ std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
         path.clear();
         while (node->is_expanded() && !node->children().empty()) {
             auto [a, next] = node->select_child();
-            path.push_back(node);
+            path.push_back(next);
             node = next;
         }
-        if (!node->is_expanded()) node->expand();
-        float val = node->total_value();
-        for (auto it = path.rbegin(); it != path.rend(); ++it) {
-            (*it)->update(val);
+        float val;
+        if (!node->is_expanded()) {
+            node->expand();
+            path.pop_back();
+            val = -node->value();
+
+        }
+        else {
+            val = node->value();
+        }
+        
+        while (!path.empty()) {
+            MCTNode* it = path.back();
+            it->update(val);
             val = -val;
+            path.pop_back();
         }
     }
-    std::cout << "--- MCTS root children stats ---\n";
-    std::cout << "FEN: " << root.game_.currentBoard().getFen() << std::endl;
-    for (auto &kv : root.children()) {
-        uint16_t action = kv.first;
-        MCTNode* child = kv.second.get();
-        std::cout
-            << "Action " << action << " UCI: " << chess::uci::moveToUci(az73::decode_action(action, root.game_.currentBoard()))
-            << " | total_value = " << child->total_value()
-            << " | visits = "      << child->visit_count()
-            << "\n";
-    }
-    std::cout << "--------------------------------\n";
-    std::vector<float> policy(ACTION_SPACE, 0.0f);
+    //std::cout << "--- MCTS root children stats ---\n";
+    //std::cout << "FEN: " << root.game_.currentBoard().getFen() << std::endl;
+    //for (auto &kv : root.children()) {
+    //    uint16_t action = kv.first;
+    //    MCTNode* child = kv.second.get();
+    //    std::cout
+    //        << "Action " << action << " UCI: " << chess::uci::moveToUci(az73::decode_action(action, root.game_.currentBoard()))
+    //        << " | total_value = " << child->total_value()
+    //        << " | visits = "      << child->visit_count()
+    //        << "\n";
+    //}
+    //std::cout << "--------------------------------\n";
+    //std::vector<float> policy(ACTION_SPACE, 0.0f);
     float tot = 0;
     for (auto &kv : root.children()) tot += kv.second->visit_count();
     if (tot > 0) {

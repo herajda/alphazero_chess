@@ -41,7 +41,7 @@ evaluate_vs_random(
     // Worker: each thread plays up to `per` White games and `per` Black games
     auto worker = [&](int per_color) {
         std::mt19937_64 rng{std::random_device{}()};
-        for (int color : {1, 0}) {  // 1 = White, 0 = Black
+        for (int color : {1}) {  // 1 = White, 0 = Black
             for (int i = 0; i < per_color; ++i) {
                 ChessGame game;
                 MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
@@ -73,15 +73,15 @@ evaluate_vs_random(
                                 best = a;
                             }
                         }
-                        std::cout << "Best move: " << best << " (p=" << best_p << ") UCI: " 
-                        << chess::uci::moveToUci(az73::decode_action(best, game.currentBoard())) << std::endl;
-                        game.makeMove(best);
+                        //std::cout << "Best move: " << best << " (p=" << best_p << ") UCI: " 
+                        //<< chess::uci::moveToUci(az73::decode_action(best, game.currentBoard())) << std::endl;
+                        //game.makeMove(best);
                     } else {
                         // random baseline
                         auto legal = game.legalMoves();
                         std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
                         size_t random_idx = uni(rng);
-                        std::cout << "Random move UCI: " << chess::uci::moveToUci(az73::decode_action(legal[random_idx], game.currentBoard())) << std::endl;
+                        //std::cout << "Random move UCI: " << chess::uci::moveToUci(az73::decode_action(legal[random_idx], game.currentBoard())) << std::endl;
                         game.makeMove(legal[random_idx]);
                     }
                 }
