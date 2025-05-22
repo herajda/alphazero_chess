@@ -182,7 +182,7 @@ std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
     //        << "\n";
     //}
     //std::cout << "--------------------------------\n";
-    //std::vector<float> policy(ACTION_SPACE, 0.0f);
+    std::vector<float> policy(ACTION_SPACE, 0.0f);
     float tot = 0;
     for (auto &kv : root.children()) tot += kv.second->visit_count();
     if (tot > 0) {
