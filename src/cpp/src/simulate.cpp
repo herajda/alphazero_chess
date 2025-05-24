@@ -14,8 +14,19 @@
 #include <iostream>
 #include <filesystem>
 #include <atomic>
+#include <csignal> // <-- add this
 
 namespace az73 {
+
+// Global atomic flag for interruption
+std::atomic<bool> interrupted{false};
+
+// Signal handler
+void handle_sigint(int) {
+    interrupted = true;
+    std::cerr << "[AZ] Caught SIGINT, stopping simulation..." << std::endl;
+}
+
 // --------------------------------------------------------------------
 // Evaluate vs random
 // --------------------------------------------------------------------
@@ -144,6 +155,12 @@ void simulate_games_buffered(
     const std::string &filename,
     int64_t capacity
 ) {
+    // Install signal handler (only once, safe for repeated calls)
+    static std::once_flag sig_flag;
+    std::call_once(sig_flag, []() {
+        std::signal(SIGINT, handle_sigint);
+    });
+
     std::cerr << "[AZ] simulate_games_buffered: model='" << model_path << "' -> buffer='" << filename << "' cap=" << capacity << "\n";
 
     // 1) Load model
@@ -200,6 +217,9 @@ void simulate_games_buffered(
 
             // grab one game at a time
             while (true) {
+                // Check for interruption before starting a new game
+                if (interrupted) break;
+
                 int idx = game_idx.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= num_games)
                     break;
@@ -213,6 +233,8 @@ void simulate_games_buffered(
                 ChessGame game;
                 MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
                 while (!game.winner().has_value()) {
+                    // Check for interruption inside game loop
+                    if (interrupted) break;
                     auto tensor = game.encodeTensor();
                     std::vector<float> flat(tensor.begin(), tensor.end());
                     auto policy = run_mcts(game, args);
@@ -234,11 +256,20 @@ void simulate_games_buffered(
                         action = d(rng);
                     }
 
+                    // Print FEN and action in UCI format
+                    //std::cout << "[AZ] size " << size << " FEN: " << game.currentBoard().getFen() << std::endl;
+                    //std::cout << "[AZ] Action: " 
+                    //          << chess::uci::moveToUci(az73::decode_action(action, game.currentBoard()))
+                    //          << std::endl;
+
                     states.push_back(std::move(flat));
                     policies.push_back(std::move(policy));
                     toplays.push_back(float(game.to_play()));
                     game.makeMove(uint16_t(action));
                 }
+
+                // If interrupted, don't write partial games
+                if (interrupted) break;
 
                 int w = *game.winner();
                 for (size_t k = 0; k < states.size(); ++k) {
@@ -254,6 +285,12 @@ void simulate_games_buffered(
     for (auto &th : threads) th.join();
     f.close();
     std::cerr << "[AZ] simulate_games_buffered DONE\n";
+
+    // If interrupted, raise Python KeyboardInterrupt
+    if (interrupted) {
+        PyErr_SetInterrupt(); // sets the Python interrupt flag
+        throw py::error_already_set();
+    }
 }
 
 } // namespace az73
