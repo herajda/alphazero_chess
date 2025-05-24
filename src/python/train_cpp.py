@@ -165,6 +165,7 @@ def main():
     torch.cuda.empty_cache()
 
 
+
     while training and iteration < args.max_iterations:
         torch.cuda.empty_cache()
         iteration += 1
