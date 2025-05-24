@@ -142,7 +142,7 @@ float MCTNode::total_value() const {
 std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args) {
     MCTNode root(1.0f, root_game);
     root.expand();
-    //root.add_exploration_noise(args.epsilon, args.alpha);
+    root.add_exploration_noise(args.epsilon, args.alpha);
     std::deque<MCTNode*> path;
     for (int i = 0; i < args.num_simulations; ++i) {
         MCTNode* node = &root;
