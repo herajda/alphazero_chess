@@ -99,11 +99,11 @@ class Agent:
                 super(TransformerModel, self).__init__()
                 self.board_size       = ChessGame.N        # 8
                 self.initial_channels = 119
-                self.dim_model        = 768               # ↑ was 512
+                self.dim_model        = 512               # ↑ was 512
                 self.num_actions      = ChessGame.ACTIONS  # 4672
-                self.num_layers       = 8                 # ↑ was 6
-                self.num_heads        = 12 # ↑ was 8
-                self.ff_multiplier    = 3
+                self.num_layers       = 6                 # ↑ was 6
+                self.num_heads        = 8 # ↑ was 8
+                self.ff_multiplier    = 2
 
                 # --- Input projection ---
                 self.input_proj = nn.Conv2d(
