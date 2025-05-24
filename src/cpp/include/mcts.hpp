@@ -35,12 +35,14 @@ public:
     void complete_expand(const std::vector<float>& policy, float v);
     [[nodiscard]] const std::unordered_map<uint16_t, std::unique_ptr<MCTNode>>& children() const;
     [[nodiscard]] int visit_count() const;
+    [[nodiscard]] float total_value() const;
+
+    ChessGame game_;
 
 private:
     float prior_;
     int visit_count_;
     float total_value_;
-    ChessGame game_;
     std::unordered_map<uint16_t, std::unique_ptr<MCTNode>> children_;
     static thread_local std::mt19937_64 rng_;
     /* ---- helper that turns raw π into safe child priors ---- */

@@ -69,6 +69,7 @@ void BatchManager::run_loop() {
         }
         if (batch.empty()) continue;
         size_t B = batch.size();
+        //std::cout << "batch size: " << B << "\n";
         std::vector<int64_t> dims = { (int64_t)B, 8, 8, 119 };
         auto options = torch::TensorOptions().dtype(torch::kFloat32);
         at::Tensor input = torch::empty(dims, options);

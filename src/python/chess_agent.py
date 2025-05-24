@@ -93,124 +93,109 @@ class Agent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def __init__(self, args):
+
         class TransformerModel(nn.Module):
             def __init__(self, args):
                 super(TransformerModel, self).__init__()
-                self.board_size = ChessGame.N  # 8
+                self.board_size       = ChessGame.N        # 8
                 self.initial_channels = 119
-                self.dim_model = 512  # Similar to num_channels in original
-                self.num_actions = ChessGame.ACTIONS
-                self.num_layers = 6
-                self.num_heads = 8
-                
-                # Input projection
-                self.input_proj = nn.Conv2d(self.initial_channels, self.dim_model, kernel_size=1)
-                
-                # Positional encoding
+                self.dim_model        = 512               # ↑ was 512
+                self.num_actions      = ChessGame.ACTIONS  # 4672
+                self.num_layers       = 6                 # ↑ was 6
+                self.num_heads        = 8 # ↑ was 8
+                self.ff_multiplier    = 2
+
+                # --- Input projection ---
+                self.input_proj = nn.Conv2d(
+                    self.initial_channels, self.dim_model, kernel_size=1
+                )
+
+                # --- 2D Positional Encoding ---
                 self.register_buffer("pos_encoding", self.create_positional_encoding())
-                
-                # Transformer layers
+
+                # --- Transformer stack ---
                 encoder_layer = nn.TransformerEncoderLayer(
                     d_model=self.dim_model,
                     nhead=self.num_heads,
-                    dim_feedforward=self.dim_model*4,
+                    dim_feedforward=self.dim_model * self.ff_multiplier,
                     dropout=0.1,
                     batch_first=True
                 )
                 self.transformer = nn.TransformerEncoder(
                     encoder_layer,
-                    num_layers= self.num_layers  # Same number of layers as residual blocks
+                    num_layers=self.num_layers
                 )
-                
-                # Policy head
-                self.policy_conv = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
+
+                # --- Policy head (same pattern as before) ---
+                self.policy_conv    = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
                 self.policy_flatten = nn.Flatten()
-                self.policy_dense = nn.Linear(2 * self.board_size * self.board_size, self.num_actions)
-                
-                # Value head
-                self.value_conv = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
-                self.value_flatten = nn.Flatten()
-                self.value_dense = nn.Linear(self.board_size * self.board_size, 1)
+                self.policy_dense   = nn.Linear(2 * self.board_size * self.board_size,
+                                                self.num_actions)
+
+                # --- Value head (same pattern as before) ---
+                self.value_conv     = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
+                self.value_flatten  = nn.Flatten()
+                self.value_dense    = nn.Linear(self.board_size * self.board_size, 1)
 
             def create_positional_encoding(self):
-                # Initialize positional encoding for 8x8 board
+                # Build a [8,8,dim_model] grid of 2D sine/cosine, then flatten to [1,64,dim_model]
                 pe = torch.zeros(self.board_size, self.board_size, self.dim_model)
-                
-                # Generate row and column frequencies
-                position_row = torch.arange(self.board_size).float().unsqueeze(1)
-                position_col = torch.arange(self.board_size).float().unsqueeze(1)
-                
-                # Frequency terms (same for rows/columns but scaled by dimension)
+                pos_row = torch.arange(self.board_size).float().unsqueeze(1)
+                pos_col = torch.arange(self.board_size).float().unsqueeze(1)
                 div_term = torch.exp(
                     torch.arange(0, self.dim_model, 2).float() *
                     (-math.log(10000.0) / self.dim_model)
                 )
-                
-                # Compute row and column encodings
+
                 pe_row = torch.zeros(self.board_size, self.dim_model)
                 pe_col = torch.zeros(self.board_size, self.dim_model)
-                
-                pe_row[:, 0::2] = torch.sin(position_row * div_term)
-                pe_row[:, 1::2] = torch.cos(position_row * div_term)
-                pe_col[:, 0::2] = torch.sin(position_col * div_term)
-                pe_col[:, 1::2] = torch.cos(position_col * div_term)
-                
-                # Combine row and column encodings for each (i,j) position
+                pe_row[:, 0::2] = torch.sin(pos_row * div_term)
+                pe_row[:, 1::2] = torch.cos(pos_row * div_term)
+                pe_col[:, 0::2] = torch.sin(pos_col * div_term)
+                pe_col[:, 1::2] = torch.cos(pos_col * div_term)
+
                 for i in range(self.board_size):
                     for j in range(self.board_size):
                         pe[i, j] = pe_row[i] + pe_col[j]
-                
-                # Flatten to [64, 512] and add batch dimension [1, 64, 512]
+
+                # flatten to [64, dim_model], then unsqueeze batch: [1,64,dim_model]
                 pe = pe.view(-1, self.dim_model).unsqueeze(0)
                 return pe
-            
+
             def forward(self, x):
-                # Input shape: [batch_size, 8, 8, 119] (chess board tensor)
-                batch_size = x.size(0)
-                
-                # --- Input Projection ---
-                # Move channels to dimension 1 (for Conv2d)
-                x = x.permute(0, 3, 1, 2)  # [batch_size, 119, 8, 8]
-                
-                # Project input to model dimension
-                x = self.input_proj(x)  # [batch_size, 512, 8, 8]
-                
+                # x: [B, 8,8,119]
+                bsz = x.size(0)
+
+                # --- Input projection ---
+                x = x.permute(0, 3, 1, 2)            # [B, 119,8,8]
+                x = self.input_proj(x)              # [B,1024,8,8]
+
                 # --- Prepare for Transformer ---
-                # Flatten spatial dimensions (8x8 -> 64)
-                x = x.flatten(2)  # [batch_size, 512, 64]
-                x = x.transpose(1, 2)  # [batch_size, 64, 512]
-                
-                # --- Add 2D Positional Encoding ---
-                x = x + self.pos_encoding # [batch_size, 64, 512]
-                
-                # --- Transformer Layers ---
-                x = self.transformer(x)  # [batch_size, 64, 512]
-                
-                # --- Reshape for Policy/Value Heads ---
-                # Convert back to 2D grid
-                x = x.transpose(1, 2)  # [batch_size, 512, 64]
-                x = x.reshape(batch_size, self.dim_model, 8, 8)  # [batch_size, 512, 8, 8]
-                
+                x = x.flatten(2).transpose(1, 2)     # [B, 64, 1024]
+                x = x + self.pos_encoding            # [B, 64, 1024]
+                x = self.transformer(x)              # [B, 64, 1024]
+
+                # --- Back to grid ---
+                x = x.transpose(1, 2).view(bsz,
+                                           self.dim_model,
+                                           self.board_size,
+                                           self.board_size)  # [B,1024,8,8]
+
                 # --- Policy Head ---
-                # 1. Convolution to reduce channels
-                policy_x = self.policy_conv(x)  # [batch_size, 2, 8, 8]
-                # 2. Flatten spatial dimensions
-                policy_x = self.policy_flatten(policy_x)  # [batch_size, 2*8*8 = 128]
-                # 3. Dense layer to action space
-                policy = F.softmax(self.policy_dense(policy_x), dim=-1)  # [batch_size, 4672]
-                
+                px = self.policy_conv(x)             # [B,2,8,8]
+                px = self.policy_flatten(px)         # [B, 128]
+                policy = F.softmax(self.policy_dense(px), dim=-1)  # [B,4672]
+
                 # --- Value Head ---
-                # 1. Convolution to single channel
-                value_x = self.value_conv(x)  # [batch_size, 1, 8, 8]
-                # 2. Flatten spatial dimensions
-                value_x = self.value_flatten(value_x)  # [batch_size, 8*8 = 64]
-                # 3. Dense layer to scalar value
-                value = torch.tanh(self.value_dense(value_x))  # [batch_size, 1]
-                
+                vx = self.value_conv(x)              # [B,1,8,8]
+                vx = self.value_flatten(vx)          # [B, 64]
+                value = torch.tanh(self.value_dense(vx))           # [B,1]
+
                 return policy, value
 
 
         self._model = TransformerModel(args).to(self.device)
+        print(f"Model parameters: {sum(p.numel() for p in self._model.parameters())}")
         self.optimizer = torch.optim.AdamW(self._model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     @classmethod

@@ -14,8 +14,19 @@
 #include <iostream>
 #include <filesystem>
 #include <atomic>
+#include <csignal> // <-- add this
 
 namespace az73 {
+
+// Global atomic flag for interruption
+std::atomic<bool> interrupted{false};
+
+// Signal handler
+void handle_sigint(int) {
+    interrupted = true;
+    std::cerr << "[AZ] Caught SIGINT, stopping simulation..." << std::endl;
+}
+
 // --------------------------------------------------------------------
 // Evaluate vs random
 // --------------------------------------------------------------------
@@ -42,7 +53,7 @@ evaluate_vs_random(
     // Worker: each thread plays up to `per` White games and `per` Black games
     auto worker = [&](int per_color) {
         std::mt19937_64 rng{std::random_device{}()};
-        for (int color : {1, 0}) {  // 1 = White, 0 = Black
+        for (int color : {1}) {  // 1 = White, 0 = Black
             for (int i = 0; i < per_color; ++i) {
                 ChessGame game;
                 MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
@@ -51,7 +62,20 @@ evaluate_vs_random(
                     if (game.to_play() == color) {
                         // our agent
                         auto policy = run_mcts(game, args);
+                        //for (size_t i = 0; i < policy.size(); ++i) {
+                        //    if (policy[i] != 0.0f) {
+                        //        std::cout << i << ": " << policy[i] << "\n";
+                        //    }
+                        //}
                         auto legal = game.legalMoves();
+                        //std::cout << "[";
+                        //for (size_t i = 0; i < legal.size(); ++i) {
+                        //    std::cout << legal[i];
+                        //    if (i + 1 != legal.size())
+                        //        std::cout << ", ";
+                        //}
+                        //std::cout << "]" << std::endl << std::endl;
+
                         // pick best move (no noise/exploration)
                         uint16_t best = legal.front();
                         float best_p = policy[best];
@@ -61,12 +85,16 @@ evaluate_vs_random(
                                 best = a;
                             }
                         }
-                        game.makeMove(best);
+                        //std::cout << "Best move: " << best << " (p=" << best_p << ") UCI: " 
+                        //<< chess::uci::moveToUci(az73::decode_action(best, game.currentBoard())) << std::endl;
+                        //game.makeMove(best);
                     } else {
                         // random baseline
                         auto legal = game.legalMoves();
                         std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
-                        game.makeMove(legal[uni(rng)]);
+                        size_t random_idx = uni(rng);
+                        //std::cout << "Random move UCI: " << chess::uci::moveToUci(az73::decode_action(legal[random_idx], game.currentBoard())) << std::endl;
+                        game.makeMove(legal[random_idx]);
                     }
                 }
                 // record result
@@ -128,11 +156,17 @@ void simulate_games_buffered(
     const std::string &filename,
     int64_t capacity
 ) {
+    // Install signal handler (only once, safe for repeated calls)
+    static std::once_flag sig_flag;
+    std::call_once(sig_flag, []() {
+        std::signal(SIGINT, handle_sigint);
+    });
+
     std::cerr << "[AZ] simulate_games_buffered: model='" << model_path << "' -> buffer='" << filename << "' cap=" << capacity << "\n";
 
     // 1) Load model
-    constexpr std::size_t GPU_BATCH = 256;
-    BatchManager::instance().init(model_path, GPU_BATCH);
+    BatchManager::instance().init(model_path, 16);
+
     py::gil_scoped_release no_gil;
 
     // 2) Open (or create) ring-buffer file
@@ -173,62 +207,92 @@ void simulate_games_buffered(
         std::cerr << "[AZ] new size=" << size << " new head=" << head << "\n";
     };
 
-    auto worker = [&](int count) {
-        thread_local std::mt19937_64 rng(std::random_device{}());
-        std::vector<std::vector<float>> states;
-        std::vector<std::vector<float>> policies;
-        std::vector<float> toplays;
-        for (int i = 0; i < count; ++i) {
-            states.clear();
-            policies.clear();
-            toplays.clear();
-            states.shrink_to_fit();
-            policies.shrink_to_fit();
-            toplays.shrink_to_fit();
-            ChessGame game;
-            MCTArgs args{num_simulations, alpha, epsilon, sampling_moves};
-            while (!game.winner().has_value()) {
-                auto tensor = game.encodeTensor();
-                std::vector<float> flat(tensor.begin(), tensor.end());
-                auto policy = run_mcts(game, args);
-                auto legal = game.legalMoves();
-                std::vector<float> masked(az73::ACTION_SPACE, 0.0f);
-                for (auto a : legal) masked[a] = policy[a];
-                float sum = std::accumulate(masked.begin(), masked.end(), 0.0f);
-                int action;
-                if (sum == 0.0f) {
-                    std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
-                    action = legal[uni(rng)];
-                } else if ((int)states.size() >= sampling_moves) {
-                    action = int(std::distance(masked.begin(), std::max_element(masked.begin(), masked.end())));
-                } else {
-                    std::discrete_distribution<int> dist(masked.begin(), masked.end());
-                    action = dist(rng);
-                }
-                states.push_back(std::move(flat));
-                policies.push_back(policy);
-                toplays.push_back(float(game.to_play()));
-                game.makeMove(uint16_t(action));
-            }
-            int w = *game.winner();
-            for (size_t k = 0; k < states.size(); ++k) {
-                float z = (w == -1 ? 0.0f : toplays[k] == float(w) ? 1.0f : -1.0f);
-                append_one(states[k], policies[k], z);
-            }
-        }
-    };
-
-    int per = (num_games + num_threads - 1) / num_threads;
-    int started = 0;
+    // --- dynamic, perfectly-balanced scheduling --------------------
+    std::atomic<int> game_idx{0};
     std::vector<std::thread> threads;
-    for (int t = 0; t < num_threads && started < num_games; ++t) {
-        int cnt = std::min(per, num_games - started);
-        threads.emplace_back(worker, cnt);
-        started += cnt;
+    threads.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            // each thread gets its own RNG
+            std::mt19937_64 rng{std::random_device{}()};
+
+            // grab one game at a time
+            while (true) {
+                // Check for interruption before starting a new game
+                if (interrupted) break;
+
+                int idx = game_idx.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= num_games)
+                    break;
+
+                // ----- simulate exactly one game -----
+                // (copy the body of 'worker' here, but for a single game)
+                std::vector<std::vector<float>> states;
+                std::vector<std::vector<float>> policies;
+                std::vector<float> toplays;
+
+                ChessGame game;
+                MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
+                while (!game.winner().has_value()) {
+                    // Check for interruption inside game loop
+                    if (interrupted) break;
+                    auto tensor = game.encodeTensor();
+                    std::vector<float> flat(tensor.begin(), tensor.end());
+                    auto policy = run_mcts(game, args);
+                    auto legal = game.legalMoves();
+
+                    std::vector<float> masked(ACTION_SPACE, 0.0f);
+                    for (auto mv : legal) masked[mv] = policy[mv];
+                    float sum = std::accumulate(masked.begin(), masked.end(), 0.0f);
+
+                    int action;
+                    if (sum == 0.0f) {
+                        std::uniform_int_distribution<size_t> u(0, legal.size() - 1);
+                        action = legal[u(rng)];
+                    } else if ((int)states.size() >= sampling_moves) {
+                        action = int(std::distance(masked.begin(),
+                                                   std::max_element(masked.begin(), masked.end())));
+                    } else {
+                        std::discrete_distribution<int> d(masked.begin(), masked.end());
+                        action = d(rng);
+                    }
+
+                    // Print FEN and action in UCI format
+                    //std::cout << "[AZ] size " << size << " FEN: " << game.currentBoard().getFen() << std::endl;
+                    //std::cout << "[AZ] Action: " 
+                    //          << chess::uci::moveToUci(az73::decode_action(action, game.currentBoard()))
+                    //          << std::endl;
+
+                    states.push_back(std::move(flat));
+                    policies.push_back(std::move(policy));
+                    toplays.push_back(float(game.to_play()));
+                    game.makeMove(uint16_t(action));
+                }
+
+                // If interrupted, don't write partial games
+                if (interrupted) break;
+
+                int w = *game.winner();
+                for (size_t k = 0; k < states.size(); ++k) {
+                    float z = (w == -1 ? 0.0f
+                                : toplays[k] == float(w) ? 1.0f
+                                                         : -1.0f);
+                    append_one(states[k], policies[k], z);
+                }
+                // ----------------------------------------
+            }
+        });
     }
     for (auto &th : threads) th.join();
     f.close();
     std::cerr << "[AZ] simulate_games_buffered DONE\n";
+
+    // If interrupted, raise Python KeyboardInterrupt
+    if (interrupted) {
+        PyErr_SetInterrupt(); // sets the Python interrupt flag
+        throw py::error_already_set();
+    }
 }
 
 } // namespace az73
