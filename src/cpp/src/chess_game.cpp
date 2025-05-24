@@ -1,5 +1,6 @@
 #include "chess_game.hpp"
 #include <algorithm>
+#include <memory>
 #include <cctype>
 #include <cmath>
 #include <numeric>
@@ -11,6 +12,7 @@ namespace {
     static constexpr std::array<std::pair<int, int>, 8> KNIGHT_DELTAS = {{{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}}};
     static constexpr std::array<int, 3> UNDERPROMO_DF{{-1, 0, 1}};
 }
+
 
 std::uint16_t encode(const chess::Board &board, const chess::Move &mv) {
     using namespace chess;
@@ -143,15 +145,20 @@ namespace {
 }
 
 ChessGame::ChessGame(std::string_view fen) {
-    history_.emplace_back(std::string{fen});
-    hashes_.push_back(history_.back().hash());
+    chess::Board b {std::string{fen}};
+    history_.push_back(chess::Board::Compact::encode(b));
+    hashes_.push_back(b.hash());
+    half_move_clock_.push_back(b.halfMoveClock());
+    full_move_number_.push_back(b.fullMoveNumber());
 }
 
 void ChessGame::makeMove(const chess::Move &m) {
     chess::Board b = currentBoard();
     b.makeMove(m);
-    history_.push_back(b);
+    history_.push_back(chess::Board::Compact::encode(b));
     hashes_.push_back(b.hash());
+    half_move_clock_.push_back(b.halfMoveClock());
+    full_move_number_.push_back(b.fullMoveNumber());
 }
 
 void ChessGame::makeMove(const std::uint16_t a) {
@@ -162,13 +169,13 @@ void ChessGame::makeMove(const std::uint16_t a) {
 ChessGame::Tensor ChessGame::encodeTensor() const {
     constexpr int PLANES_PER_STEP = 14;
     Tensor x{};
-    const chess::Board &cur = history_.back();
+    const chess::Board cur = currentBoard();
     const Color P1 = cur.sideToMove();
     const Color P2 = (P1 == Color::WHITE ? Color::BLACK : Color::WHITE);
     for (int t = 0; t < 8; ++t) {
         int hIdx = static_cast<int>(history_.size()) - 1 - t;
         if (hIdx < 0) break;
-        const chess::Board &b = history_[hIdx];
+        const chess::Board b = boardAt(hIdx); 
         const bool flip = (b.sideToMove() != P1);
         const Color view = flip ? P2 : P1;
         const int base = t * PLANES_PER_STEP;
@@ -243,3 +250,24 @@ std::optional<int> ChessGame::winner() const {
 int ChessGame::to_play() const noexcept {
     return (currentBoard().sideToMove() == chess::Color::WHITE) ? 1 : 0;
 }
+
+chess::Board ChessGame::boardAt(std::size_t idx) const
+{
+    chess::Board pos = chess::Board::Compact::decode(history_[idx]);
+
+    std::string fen = pos.getFen(/*move_counters = */ false);
+
+    fen += ' ';
+    fen += std::to_string(half_move_clock_[idx]);   // 50-move counter
+    fen += ' ';
+    fen += std::to_string(full_move_number_[idx]);  // full move counter 
+
+    return chess::Board::fromFen(fen);
+}
+
+chess::Board ChessGame::currentBoard() const
+{
+    return boardAt(history_.size() - 1);
+}
+
+
