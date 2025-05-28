@@ -18,6 +18,12 @@ import torch
 import chess_engine
 from chess_agent import Agent, adjust_learning_rate
 
+import threading
+from torch.utils.tensorboard import SummaryWriter
+import chess.engine
+import chess
+import math
+import chess_moves
 # Constants for record sizes
 RECORD_STATE = 8 * 8 * 119         # number of floats in state
 RECORD_POLICY = 4672               # number of floats in policy (8*8*73)
@@ -76,13 +82,17 @@ def parse_args():
     parser.add_argument("--final_learning_rate", type=float, default=0.0001, help="Final learning rate after decay.")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="AdamW weight decay.")
     parser.add_argument("--total_decay_iterations", type=int, default=500, help="Iterations over which to linearly decay the learning rate.")
-    parser.add_argument("--evaluate_each", type=int, default=10, help="Perform evaluation every N iterations.")
+    parser.add_argument("--evaluate_each", type=int, default=15, help="Perform evaluation every N iterations.")
     parser.add_argument("--checkpoint_interval", type=int, default=50, help="Save model checkpoint every N iterations.")
     parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum number of training iterations.")
     parser.add_argument("--model_path", type=str, default="model.pt", help="Path to save final model.")
     parser.add_argument("--replay_buffer_capacity", type=int, default=1000000, help="Max on-disk entries in ring buffer.")
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
     parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
+    parser.add_argument("--eval_games_per_color", type=int, default=10, help="Number of eval games per color vs Stockfish and vs Random.")
+    parser.add_argument("--stockfish_path", type=str, default="/usr/games/stockfish",help="Path to Stockfish binary for ELO evaluation.")
+    parser.add_argument("--stockfish_depth", type=int, default=12, help="Search depth for Stockfish during evaluation.")
+    parser.add_argument("--stockfish_elo", type=int, default=1500, help="Simulated Elo for Stockfish (via UCI_LimitStrength/UCI_Elo)")
     return parser.parse_args()
 
 def evaluate_model(agent, ts_path, num_games, num_threads, num_simulations_eval, alpha, epsilon, sampling_moves):
@@ -99,6 +109,96 @@ def evaluate_model(agent, ts_path, num_games, num_threads, num_simulations_eval,
     print(f"As White: {w_win}W / {w_loss}L / {w_draw}D")
     print(f"As Black: {b_win}W / {b_loss}L / {b_draw}D")
     return w_win, w_loss, w_draw, b_win, b_loss, b_draw
+def evaluate_vs_stockfish(ts_path, num_games, args):
+    """
+    Play `num_games` per color between our model (using the C++ select_move binding)
+    and Stockfish (via python-chess UCI). Return (w, l, d) from our model’s POV.
+    """
+    engine = chess.engine.SimpleEngine.popen_uci(args.stockfish_path)
+    engine.configure({"Threads": 4, "UCI_LimitStrength": True,
+        "UCI_Elo": args.stockfish_elo})
+    wins = losses = draws = 0
+
+    for our_color in [chess.WHITE, chess.BLACK]:
+        for _ in range(num_games):
+            board = chess.Board()
+            # alternate turns until game over
+            while board.is_game_over(claim_draw=True) is False:
+                if board.turn == our_color:
+                    # ask C++ binding for our move
+                    fen = board.fen()
+                    action = chess_engine.select_move(
+                        ts_path, fen,
+                        400,
+                        args.alpha, 0, args.sampling_moves
+                    )
+                    uci = chess_moves.action_to_uci(board, action)
+                    if uci is None:
+                        raise RuntimeError("Invalid action {action} returned by C++ engine")
+                        
+                    board.push_uci(uci)
+                else:
+                    # let Stockfish reply
+                    result = engine.play(board, chess.engine.Limit(depth=args.stockfish_depth))
+                    board.push(result.move)
+
+            result = board.result(claim_draw=True)
+            if result == "1-0":
+                winner = chess.WHITE
+            elif result == "0-1":
+                winner = chess.BLACK
+            else:
+                winner = None
+
+            if winner is None:
+                draws += 1
+            elif winner == our_color:
+                wins += 1
+            else:
+                losses += 1
+
+    engine.quit()
+    return wins, losses, draws
+
+def spawn_async_evaluation(iteration, ts_path, agent, args, writer):
+    """
+    Kick off both Random and Stockfish evals in a background thread,
+    compute Elo vs Stockfish, and write all scalars to TensorBoard.
+    """
+    def _job():
+        # 2) Stockfish eval
+        sW, sL, sD = evaluate_vs_stockfish(ts_path, args.eval_games_per_color, args)
+        score_sf = (sW + 0.5*sD) / (args.eval_games_per_color * 2)
+        # 1) Random eval
+        print("Evaluating model vs Random player...")
+        scheduled_num_simulations = get_scheduled_num_simulations(iteration, args)
+        wW, wL, wD, bW, bL, bD = evaluate_model(
+            agent, ts_path,
+            args.eval_games_per_color,
+            args.threads,
+            scheduled_num_simulations,  # Use scheduled num_simulations
+            args.alpha, args.epsilon, args.sampling_moves
+        )
+        total = 2 * args.eval_games_per_color
+        score_random = (wW + bW + 0.5*(wD + bD)) / total
+
+
+        # 3) Elo estimate vs Stockfish 
+        R_sf = args.stockfish_elo  
+        # avoid scores=0 or 1
+        eps = 1e-4
+        p = max(eps, min(1 - eps, score_sf))
+        dR = -400 * math.log10(1/p - 1)
+        R_model = R_sf + dR
+
+        # 4) log to TensorBoard
+        writer.add_scalar("Eval/WinRate_vs_Random", score_random, iteration)
+        writer.add_scalar("Eval/WinRate_vs_Stockfish", score_sf, iteration)
+        writer.add_scalar("Eval/Elo_vs_Stockfish", R_model, iteration)
+        writer.flush()
+
+    th = threading.Thread(target=_job, daemon=True)
+    th.start()
 def get_scheduled_num_simulations(iteration, args):
     """Linearly interpolate num_simulations from start to end over num_simulations_steps."""
     if args.num_simulations_steps <= 1:
@@ -110,6 +210,8 @@ def get_scheduled_num_simulations(iteration, args):
 
 def main():
     args = parse_args()
+    writer = SummaryWriter(log_dir=getattr(args, "log_dir", None))
+
 
     # set seeds and threading
     np.random.seed(args.seed)
@@ -133,16 +235,8 @@ def main():
         print("Evaluating model before training...")
         ts_path = f"model_ts_initial.pt"
         subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
-        evaluate_model(
-            agent,
-            ts_path,
-            num_games=10,
-            num_threads=args.threads,
-            num_simulations_eval=args.num_simulations_eval,
-            alpha=args.alpha,
-            epsilon=args.epsilon,
-            sampling_moves=args.sampling_moves
-        )
+        spawn_async_evaluation(iteration, ts_path, agent, args, writer)
+
     if args.pretrain:
         # pretraining 
         agent._model.train()
@@ -217,18 +311,9 @@ def main():
         torch.cuda.empty_cache()
 
         # periodic evaluation placeholder
-        #if iteration % args.evaluate_each == 0:
-        #    evaluate_model(
-        #        agent,
-        #        ts_path,
-        #        num_games=10,
-        #        num_threads=args.threads,
-        #        num_simulations_eval=args.num_simulations_eval,
-        #        alpha=args.alpha,
-        #        epsilon=args.epsilon,
-        #        sampling_moves=args.sampling_moves
-        #    )
-        #    torch.cuda.empty_cache()
+        if iteration % args.evaluate_each == 0:
+            spawn_async_evaluation(iteration, ts_path, agent, args, writer)
+            torch.cuda.empty_cache()
 
         # periodic checkpoint
         if iteration % args.checkpoint_interval == 0:
