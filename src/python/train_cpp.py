@@ -66,6 +66,7 @@ def parse_args():
     parser.add_argument("--start_num_simulations", type=int, default=30, help="Initial number of MCTS simulations per move.")
     parser.add_argument("--end_num_simulations", type=int, default=200, help="Final number of MCTS simulations per move.")
     parser.add_argument("--num_simulations_steps", type=int, default=100, help="Number of steps over which to linearly decay num_simulations.")
+    parser.add_argument("--num_simulations_eval", type=int, default=100, help="Eval num_simulations")
     parser.add_argument("--alpha", type=float, default=0.3, help="Dirichlet alpha for root noise.")
     parser.add_argument("--epsilon", type=float, default=0.25, help="Exploration epsilon for root noise.")
     parser.add_argument("--sampling_moves", type=int, default=30, help="Number of moves to sample before switching to greedy.")
@@ -216,18 +217,18 @@ def main():
         torch.cuda.empty_cache()
 
         # periodic evaluation placeholder
-        if iteration % args.evaluate_each == 0:
-            evaluate_model(
-                agent,
-                ts_path,
-                num_games=10,
-                num_threads=args.threads,
-                num_simulations_eval=args.num_simulations_eval,
-                alpha=args.alpha,
-                epsilon=args.epsilon,
-                sampling_moves=args.sampling_moves
-            )
-            torch.cuda.empty_cache()
+        #if iteration % args.evaluate_each == 0:
+        #    evaluate_model(
+        #        agent,
+        #        ts_path,
+        #        num_games=10,
+        #        num_threads=args.threads,
+        #        num_simulations_eval=args.num_simulations_eval,
+        #        alpha=args.alpha,
+        #        epsilon=args.epsilon,
+        #        sampling_moves=args.sampling_moves
+        #    )
+        #    torch.cuda.empty_cache()
 
         # periodic checkpoint
         if iteration % args.checkpoint_interval == 0:

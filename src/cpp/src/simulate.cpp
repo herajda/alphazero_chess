@@ -296,6 +296,10 @@ void simulate_games_buffered(
 }
 
 } // namespace az73
+namespace py = pybind11;
+using az73::BatchManager;
+using az73::MCTArgs;
+using az73::run_mcts;
 
 PYBIND11_MODULE(chess_engine, m) {
     m.doc() = "C++ self-play with batched inference and on-disk ring buffer";
@@ -320,4 +324,48 @@ PYBIND11_MODULE(chess_engine, m) {
           py::arg("sampling_moves"),
           "Evaluate the AlphaZero agent vs a random agent, returning "
           "(white_wins, white_losses, white_draws, black_wins, black_losses, black_draws).");
+    m.def("select_move",
+        // Lambda takes: path to TorchScript, FEN, MCTS params → returns best flat action
+        [](const std::string &model_path,
+           const std::string &fen,
+           int num_simulations,
+           double alpha,
+           double epsilon,
+           int sampling_moves) -> uint16_t
+        {
+            // 1) Initialize the batched model (use a reasonable batch size)
+            constexpr size_t BATCH = 1;
+            BatchManager::instance().init(model_path, BATCH);
+
+            // 2) Build game from FEN
+            ChessGame game(fen);
+
+            // 3) Run MCTS
+            MCTArgs args{num_simulations, alpha, epsilon, sampling_moves};
+            auto policy = run_mcts(game, args);
+
+            // 4) Pick the highest-probability legal move
+            auto legal = game.legalMoves();
+            uint16_t best = legal.front();
+            float best_p = policy[best];
+            for (auto a : legal) {
+                if (policy[a] > best_p) {
+                    best_p = policy[a];
+                    best   = a;
+                }
+            }
+            return best;
+        },
+        py::arg("model_path"),
+        py::arg("fen"),
+        py::arg("num_simulations"),
+        py::arg("alpha"),
+        py::arg("epsilon"),
+        py::arg("sampling_moves"),
+        R"pbdoc(
+            select_move(model_path, fen, num_simulations, alpha, epsilon, sampling_moves) -> action_index
+
+            Run MCTS from the given FEN and return the chosen move (flattened 0–4671).
+        )pbdoc"
+    ); 
 }
