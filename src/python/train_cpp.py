@@ -8,22 +8,12 @@ with on-disk circular replay buffer.
 import argparse
 import os
 os.environ["MKL_THREADING_LAYER"] = "GNU"  
-import struct
-import random
-import subprocess
+import struct, random, subprocess, json, threading, math
 
-import numpy as np
-import torch
-
-import chess_engine
+import numpy as np, torch, chess_engine
+from torch.utils.tensorboard import SummaryWriter
 from chess_agent import Agent, adjust_learning_rate
 
-import threading
-from torch.utils.tensorboard import SummaryWriter
-import chess.engine
-import chess
-import math
-import chess_moves
 # Constants for record sizes
 RECORD_STATE = 8 * 8 * 119         # number of floats in state
 RECORD_POLICY = 4672               # number of floats in policy (8*8*73)
@@ -69,10 +59,10 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--threads", type=int, default=30, help="Number of C++ self-play threads (and inference batch).")
     parser.add_argument("--sim_games", type=int, default=200, help="Number of self-play games per iteration.")
-    parser.add_argument("--start_num_simulations", type=int, default=30, help="Initial number of MCTS simulations per move.")
-    parser.add_argument("--end_num_simulations", type=int, default=200, help="Final number of MCTS simulations per move.")
+    parser.add_argument("--start_num_simulations", type=int, default=100, help="Initial number of MCTS simulations per move.")
+    parser.add_argument("--end_num_simulations", type=int, default=500, help="Final number of MCTS simulations per move.")
     parser.add_argument("--num_simulations_steps", type=int, default=100, help="Number of steps over which to linearly decay num_simulations.")
-    parser.add_argument("--num_simulations_eval", type=int, default=100, help="Eval num_simulations")
+    parser.add_argument("--num_simulations_eval", type=int, default=300, help="Eval num_simulations")
     parser.add_argument("--alpha", type=float, default=0.3, help="Dirichlet alpha for root noise.")
     parser.add_argument("--epsilon", type=float, default=0.25, help="Exploration epsilon for root noise.")
     parser.add_argument("--sampling_moves", type=int, default=30, help="Number of moves to sample before switching to greedy.")
@@ -89,116 +79,75 @@ def parse_args():
     parser.add_argument("--replay_buffer_capacity", type=int, default=1000000, help="Max on-disk entries in ring buffer.")
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
     parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
-    parser.add_argument("--eval_games_per_color", type=int, default=10, help="Number of eval games per color vs Stockfish and vs Random.")
+    parser.add_argument("--eval_games_per_color", type=int, default=50, help="Number of eval games per color vs Stockfish and vs Random.")
     parser.add_argument("--stockfish_path", type=str, default="/usr/games/stockfish",help="Path to Stockfish binary for ELO evaluation.")
     parser.add_argument("--stockfish_depth", type=int, default=12, help="Search depth for Stockfish during evaluation.")
-    parser.add_argument("--stockfish_elo", type=int, default=1500, help="Simulated Elo for Stockfish (via UCI_LimitStrength/UCI_Elo)")
+    parser.add_argument("--stockfish_elo", type=int, default=1320, help="Simulated Elo for Stockfish (via UCI_LimitStrength/UCI_Elo)")
     return parser.parse_args()
 
-def evaluate_model(agent, ts_path, num_games, num_threads, num_simulations_eval, alpha, epsilon, sampling_moves):
-    """Evaluate the model against a random player."""
-    w_win, w_loss, w_draw, b_win, b_loss, b_draw = chess_engine.evaluate_vs_random(
-        ts_path,
-        num_games,
-        num_threads,
-        num_simulations_eval,
-        alpha,
-        epsilon,
-        sampling_moves
-    )
-    print(f"As White: {w_win}W / {w_loss}L / {w_draw}D")
-    print(f"As Black: {b_win}W / {b_loss}L / {b_draw}D")
-    return w_win, w_loss, w_draw, b_win, b_loss, b_draw
-def evaluate_vs_stockfish(ts_path, num_games, args):
+# ---------------------------------------------------------------------------
+#                         ###  BEGIN EVAL SECTION  ###
+# ---------------------------------------------------------------------------
+
+def spawn_async_evaluation(iteration: int, ts_path: str, args, writer):
     """
-    Play `num_games` per color between our model (using the C++ select_move binding)
-    and Stockfish (via python-chess UCI). Return (w, l, d) from our model’s POV.
+    Launch `evaluate_worker.py` in a *separate* process and stream its JSON
+    result into TensorBoard without blocking training.
     """
-    engine = chess.engine.SimpleEngine.popen_uci(args.stockfish_path)
-    engine.configure({"Threads": 4, "UCI_LimitStrength": True,
-        "UCI_Elo": args.stockfish_elo})
-    wins = losses = draws = 0
 
-    for our_color in [chess.WHITE, chess.BLACK]:
-        for _ in range(num_games):
-            board = chess.Board()
-            # alternate turns until game over
-            while board.is_game_over(claim_draw=True) is False:
-                if board.turn == our_color:
-                    # ask C++ binding for our move
-                    fen = board.fen()
-                    action = chess_engine.select_move(
-                        ts_path, fen,
-                        400,
-                        args.alpha, 0, args.sampling_moves
-                    )
-                    uci = chess_moves.action_to_uci(board, action)
-                    if uci is None:
-                        raise RuntimeError("Invalid action {action} returned by C++ engine")
-                        
-                    board.push_uci(uci)
-                else:
-                    # let Stockfish reply
-                    result = engine.play(board, chess.engine.Limit(depth=args.stockfish_depth))
-                    board.push(result.move)
+    cmd = [
+        "python3", "-u", "evaluate_worker.py",
+        "--model-ts", ts_path,
+        "--games",      str(args.eval_games_per_color),
+        "--sims",       str(args.num_simulations_eval),
+        "--alpha",      str(args.alpha),
+        "--epsilon",    "0",
+        "--sampling",   str(args.sampling_moves),
+        "--sf-bin",     args.stockfish_path,
+        "--sf-depth",   str(args.stockfish_depth),
+        "--sf-elo",     str(args.stockfish_elo)
+    ]
 
-            result = board.result(claim_draw=True)
-            if result == "1-0":
-                winner = chess.WHITE
-            elif result == "0-1":
-                winner = chess.BLACK
-            else:
-                winner = None
-
-            if winner is None:
-                draws += 1
-            elif winner == our_color:
-                wins += 1
-            else:
-                losses += 1
-
-    engine.quit()
-    return wins, losses, draws
-
-def spawn_async_evaluation(iteration, ts_path, agent, args, writer):
-    """
-    Kick off both Random and Stockfish evals in a background thread,
-    compute Elo vs Stockfish, and write all scalars to TensorBoard.
-    """
     def _job():
-        # 2) Stockfish eval
-        sW, sL, sD = evaluate_vs_stockfish(ts_path, args.eval_games_per_color, args)
-        score_sf = (sW + 0.5*sD) / (args.eval_games_per_color * 2)
-        # 1) Random eval
-        print("Evaluating model vs Random player...")
-        scheduled_num_simulations = get_scheduled_num_simulations(iteration, args)
-        wW, wL, wD, bW, bL, bD = evaluate_model(
-            agent, ts_path,
-            args.eval_games_per_color,
-            args.threads,
-            scheduled_num_simulations,  # Use scheduled num_simulations
-            args.alpha, args.epsilon, args.sampling_moves
-        )
+        try:
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            report = json.loads(proc.stdout)        # {'random': {...}, 'stockfish': {...}}
+        except Exception as e:
+            print(f"[Eval] worker failed: {e}\ncmd: {' '.join(cmd)}")
+            return
+
+        # ---------- Random baseline ----------
+        rnd = report["random"]
         total = 2 * args.eval_games_per_color
-        score_random = (wW + bW + 0.5*(wD + bD)) / total
+        win_rate_random = (
+            rnd["wW"] + rnd["bW"] + 0.5 * (rnd["wD"] + rnd["bD"])
+        ) / total
 
+        # ---------- Stockfish ----------
+        sf = report["stockfish"]
+        win_rate_sf = (sf["W"] + 0.5 * sf["D"]) / total
 
-        # 3) Elo estimate vs Stockfish 
-        R_sf = args.stockfish_elo  
-        # avoid scores=0 or 1
+        # Elo vs Stockfish
         eps = 1e-4
-        p = max(eps, min(1 - eps, score_sf))
-        dR = -400 * math.log10(1/p - 1)
-        R_model = R_sf + dR
+        p = max(eps, min(1 - eps, win_rate_sf))
+        elo = args.stockfish_elo - 400 * math.log10(1 / p - 1)
 
-        # 4) log to TensorBoard
-        writer.add_scalar("Eval/WinRate_vs_Random", score_random, iteration)
-        writer.add_scalar("Eval/WinRate_vs_Stockfish", score_sf, iteration)
-        writer.add_scalar("Eval/Elo_vs_Stockfish", R_model, iteration)
+        # ---------- log ----------
+        writer.add_scalar("Eval/WinRate_vs_Random",   win_rate_random, iteration)
+        writer.add_scalar("Eval/WinRate_vs_Stockfish", win_rate_sf,     iteration)
+        writer.add_scalar("Eval/Elo_vs_Stockfish",     elo,            iteration)
         writer.flush()
 
-    th = threading.Thread(target=_job, daemon=True)
-    th.start()
+        print(f"[Eval] iteration {iteration}: "
+              f"Rnd={win_rate_random:.3f}, SF={win_rate_sf:.3f}, Elo={elo:.0f}")
+
+    threading.Thread(target=_job, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+#                          ###  END EVAL SECTION  ###
+# ---------------------------------------------------------------------------
+
+
 def get_scheduled_num_simulations(iteration, args):
     """Linearly interpolate num_simulations from start to end over num_simulations_steps."""
     if args.num_simulations_steps <= 1:
@@ -235,7 +184,7 @@ def main():
         print("Evaluating model before training...")
         ts_path = f"model_ts_initial.pt"
         subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
-        spawn_async_evaluation(iteration, ts_path, agent, args, writer)
+        spawn_async_evaluation(iteration, ts_path, args, writer)
 
     if args.pretrain:
         # pretraining 
@@ -312,7 +261,7 @@ def main():
 
         # periodic evaluation placeholder
         if iteration % args.evaluate_each == 0:
-            spawn_async_evaluation(iteration, ts_path, agent, args, writer)
+            spawn_async_evaluation(iteration, ts_path, args, writer)
             torch.cuda.empty_cache()
 
         # periodic checkpoint
