@@ -27,7 +27,7 @@ public:
     // Enqueue a flat tensor, return a future for {policy, value}
     std::future<std::pair<std::vector<float>, float>>
     enqueue(const std::vector<float>& flat_tensor);
-
+    std::string current_path_;
 private:
     BatchManager() = default;
     ~BatchManager();
