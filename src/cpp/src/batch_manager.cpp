@@ -23,10 +23,18 @@ BatchManager::~BatchManager() {
 }
 
 void BatchManager::init(const std::string& model_path, size_t batch_size) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) {
+    std::unique_lock<std::mutex> lk(mtx_);
+    if (running_ && current_path_ == model_path) {
         batch_size_ = batch_size;
         return;
+    }
+    if (running_) {
+        running_ = false;
+        cv_.notify_all();
+        lk.unlock();
+        runner_thread_.join();
+        lk.lock();
+        queue_.clear();
     }
     module_ = torch::jit::load(model_path);
     module_.eval();
@@ -35,6 +43,7 @@ void BatchManager::init(const std::string& model_path, size_t batch_size) {
     device_ = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
     module_.to(device_);
     batch_size_ = batch_size;
+    current_path_ = model_path;
     running_ = true;
     runner_thread_ = std::thread(&BatchManager::run_loop, this);
 }
