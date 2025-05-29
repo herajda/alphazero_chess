@@ -187,3 +187,14 @@ venv/
 # Temporary files
 *.log
 *.swp
+
+# Training files
+*.pt
+games.bin
+runs/
+
+# Build
+
+build/
+build-debug/
+
