@@ -43,7 +43,8 @@ def sample_from_file(path: str, batch_size: int):
             f.seek(off)
             # read state
             b = f.read(RECORD_STATE * 4)
-            state = np.frombuffer(b, dtype=np.float32).reshape(8, 8, 119)
+            state = np.frombuffer(b, dtype=np.float32).reshape(119, 8, 8) 
+            state = np.transpose(state, (1, 2, 0))  # reshape to (8, 8, 119)
             # read policy
             pb = f.read(RECORD_POLICY * 4)
             policy = np.frombuffer(pb, dtype=np.float32)
@@ -261,6 +262,8 @@ def main():
 
         # periodic evaluation placeholder
         if iteration % args.evaluate_each == 0:
+            new_ts = f"model_ts_{iteration}_eval.pt"
+            subprocess.run(["python3", "export_torchscript.py", args.model_path, new_ts], check=True)
             spawn_async_evaluation(iteration, ts_path, args, writer)
             torch.cuda.empty_cache()
 
