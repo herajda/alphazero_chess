@@ -87,7 +87,7 @@ evaluate_vs_random(
                         }
                         //std::cout << "Best move: " << best << " (p=" << best_p << ") UCI: " 
                         //<< chess::uci::moveToUci(az73::decode_action(best, game.currentBoard())) << std::endl;
-                        //game.makeMove(best);
+                        game.makeMove(best);
                     } else {
                         // random baseline
                         auto legal = game.legalMoves();
