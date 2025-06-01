@@ -53,7 +53,7 @@ evaluate_vs_random(
     // Worker: each thread plays up to `per` White games and `per` Black games
     auto worker = [&](int per_color) {
         std::mt19937_64 rng{std::random_device{}()};
-        for (int color : {1}) {  // 1 = White, 0 = Black
+        for (int color : {0, 1}) {  // 1 = White, 0 = Black
             for (int i = 0; i < per_color; ++i) {
                 ChessGame game;
                 MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
