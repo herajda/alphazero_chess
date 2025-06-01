@@ -212,35 +212,41 @@ std::vector<float> run_mcts(const ChessGame &root_game, const MCTArgs &args)
     root.expand();
     root.add_exploration_noise(args.epsilon, args.alpha);
 
-    std::deque<MCTNode*> path;
+
     for (int i = 0; i < args.num_simulations; ++i) {
+        std::deque<MCTNode*> path;
         MCTNode* node = &root;
-        path.clear();
+        path.push_back(node);
+
         while (node->is_expanded() && !node->children().empty()) {
             auto [a, next] = node->select_child();
-            path.push_back(next);
             node = next;
+            path.push_back(node);
         }
 
-        float val;
+        
+        bool expanded_now = false;
         if (!node->is_expanded()) {
             node->expand();
-            path.pop_back();
-            val = -node->value();
+            expanded_now = true;
+        }
 
-        }
-        else {
-            val = node->value();
-        }
-        
-        while (!path.empty()) {
-            MCTNode* it = path.back();
-            it->update(val);
+        float val = node->value();
+
+        auto it = path.rbegin(); 
+
+        if (expanded_now) {
+            ++it;
             val = -val;
-            path.pop_back();
+        }
+        for (; it != path.rend(); ++it) {
+            (*it)->update(val);
+            val = -val;
         }
     }
     //std::cout << "--- MCTS root children stats ---\n";
+    //std::cout << root.visit_count() << " visits, "
+    //          << root.total_value() << " total value\n";
     //std::cout << "FEN: " << root.game_.currentBoard().getFen() << std::endl;
     //for (auto &kv : root.children()) {
     //    uint16_t action = kv.first;
