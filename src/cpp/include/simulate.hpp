@@ -29,5 +29,19 @@ void simulate_games_buffered(
     const std::string &filename,
     int64_t replay_buffer_capacity
 );
+// add just below evaluate_vs_random declaration
+std::tuple<int,int,int,int,int,int>
+evaluate_vs_stockfish(
+    const std::string &model_path,     // TorchScript network
+    const std::string &sf_bin,         // path to Stockfish executable
+    int games_per_color,               // #games as White and as Black
+    int num_threads,                   // evaluation threads
+    int sf_depth,                      // “go depth” (ignored if elo≥0)
+    int sf_elo,                        // set to ≥0 to use UCI_Elo mode
+    int num_simulations,               // our MCTS sims / move
+    double alpha, double epsilon,
+    int sampling_moves
+);
+
 
 } // namespace az73

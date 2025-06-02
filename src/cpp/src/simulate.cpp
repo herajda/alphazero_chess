@@ -26,6 +26,165 @@ void handle_sigint(int) {
     interrupted = true;
     std::cerr << "[AZ] Caught SIGINT, stopping simulation..." << std::endl;
 }
+// --------------------------------------------------------------------
+// Evaluate vs STOCKFISH (UCI) -- threaded & batched
+// --------------------------------------------------------------------
+namespace {
+
+// very small helper: spawn Stockfish, return a pair of i/o streams
+struct UciEngine {
+    std::string bin;
+    FILE *in  = nullptr;   // write TO engine
+    FILE *out = nullptr;   // read  FROM engine
+
+    explicit UciEngine(const std::string &path) : bin(path) {
+        int in_pipe [2], out_pipe[2];
+        pipe(in_pipe);  pipe(out_pipe);
+
+        pid_t pid = fork();
+        if (pid == 0) {               // child → Stockfish
+            dup2(in_pipe [0], STDIN_FILENO);
+            dup2(out_pipe[1], STDOUT_FILENO);
+            close(in_pipe [1]); close(out_pipe[0]);
+            execl(bin.c_str(), bin.c_str(), nullptr);
+            _exit(127);
+        }
+        // parent
+        close(in_pipe [0]);  close(out_pipe[1]);
+        in  = fdopen(in_pipe [1],  "w");
+        out = fdopen(out_pipe[0],  "r");
+
+        // initialise UCI
+        fprintf(in, "uci\n");  fflush(in);
+        wait_ready();
+    }
+    ~UciEngine() { if (in) { fputs("quit\n", in); fflush(in);} }
+
+    void send(const std::string &cmd) { fputs(cmd.c_str(), in); fputc('\n', in); fflush(in);}
+    std::string readline() {
+        char buf[256];
+        if (!fgets(buf, sizeof(buf), out)) return {};
+        return std::string(buf);
+    }
+    void wait_ready() {
+        send("isready");
+        std::string s;
+        while ((s = readline()).find("readyok") == std::string::npos) {}
+    }
+    void set_options(int elo, int threads) {
+        if (elo >= 0) {
+            send("setoption name UCI_LimitStrength value true");
+            send("setoption name UCI_Elo          value " + std::to_string(elo));
+        }
+        send("setoption name Threads value " + std::to_string(threads));
+        wait_ready();
+    }
+
+    // get bestmove in UCI for the current position
+    std::string bestmove(const std::string &fen,
+                         int depth, bool use_depth) {
+        send("position fen " + fen);
+        if (use_depth) send("go depth " + std::to_string(depth));
+        else           send("go movetime 100");          // fallback
+        std::string s;
+        while ((s = readline()).rfind("bestmove ",0)) {}  // wait
+        auto mv   = s.substr(9);           // drop "bestmove "
+        mv.erase(mv.find_first_of(" \t\r\n")); // trim right
+        return mv;
+    }
+}; // struct UciEngine
+}  // anonymous namespace
+
+    // helper: returns a *legal* chess::Move that corresponds to action_id
+    static chess::Move id_to_legal_move(const chess::Board &board,
+                                        uint16_t action_id)
+    {
+        using namespace chess;
+        Movelist legal;
+        movegen::legalmoves<movegen::MoveGenType::ALL>(legal, board,
+                PieceGenType::PAWN   | PieceGenType::KNIGHT | PieceGenType::BISHOP |
+                PieceGenType::ROOK   | PieceGenType::QUEEN  | PieceGenType::KING);
+        
+        for (const Move &m : legal)           // round-trip test
+            if (encode(board, m) == action_id)
+                return m;                     // found exact match
+        
+        // *** should never happen, but be defensive ***
+        return legal.empty() ? Move::NULL_MOVE : legal[0];
+    }
+// public API
+std::tuple<int,int,int,int,int,int>
+evaluate_vs_stockfish(
+    const std::string &model_path,
+    const std::string &sf_bin,
+    int games_per_color,
+    int num_threads,
+    int sf_depth,
+    int sf_elo,
+    int num_simulations,
+    double alpha,
+    double epsilon,
+    int sampling_moves)
+{
+    using namespace chess;
+    constexpr std::size_t GPU_BATCH = 256;
+    BatchManager::instance().init(model_path, GPU_BATCH);
+
+    std::atomic<int> wW{0}, wL{0}, wD{0}, bW{0}, bL{0}, bD{0};
+    std::atomic<int> gidx{0};
+
+    auto worker = [&](int tid) {
+        UciEngine sf(sf_bin);
+        sf.set_options(sf_elo, 1);   // 1 thread/engine
+
+        while (true) {
+            int idx = gidx.fetch_add(1);
+            if (idx >= 2 * games_per_color) break;
+
+            bool agent_is_white = (idx < games_per_color);
+            int  us_turn_code  = agent_is_white ? 1 : 0;
+
+            ChessGame game;
+            MCTArgs args{num_simulations, alpha, epsilon, sampling_moves};
+
+            while (!game.winner().has_value()) {
+                if (game.to_play() == us_turn_code) {
+                    auto policy = run_mcts(game, args);
+                    auto legal  = game.legalMoves();
+                    uint16_t best = *std::max_element(
+                        legal.begin(), legal.end(),
+                        [&](uint16_t a, uint16_t b){return policy[a] < policy[b];});
+                    game.makeMove(best);
+
+                } else {
+                    std::string fen   = game.currentBoard().getFen();
+
+                    std::string uci   = sf.bestmove(fen, sf_depth, sf_elo < 0);
+                    chess::Move  mv   = chess::uci::uciToMove(game.currentBoard(), uci);
+                    uint16_t a = encode(game.currentBoard(), mv);
+
+                    game.makeMove(a);
+                }
+            }
+            int res = *game.winner();       // 1 white win, 0 black win, -1 draw
+            if (agent_is_white) {
+                if (res ==  1) wW++; else
+                if (res ==  0) wL++; else wD++;
+            } else {
+                if (res ==  0) bW++; else
+                if (res ==  1) bL++; else bD++;
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker, t);
+    for (auto &th : pool) th.join();
+
+    return {wW.load(), wL.load(), wD.load(),
+            bW.load(), bL.load(), bD.load()};
+}
+
 
 // --------------------------------------------------------------------
 // Evaluate vs random
@@ -43,88 +202,86 @@ evaluate_vs_random(
     // 1) initialize model (batch size == num_threads)
     constexpr std::size_t GPU_BATCH = 256;
     BatchManager::instance().init(model_path, GPU_BATCH);
-    // release GIL while doing C++ work
     py::gil_scoped_release no_gil;
 
     // 2) counters
     std::atomic<int> w_win{0}, w_loss{0}, w_draw{0};
     std::atomic<int> b_win{0}, b_loss{0}, b_draw{0};
 
-    // Worker: each thread plays up to `per` White games and `per` Black games
-    auto worker = [&](int per_color) {
-        std::mt19937_64 rng{std::random_device{}()};
-        for (int color : {0, 1}) {  // 1 = White, 0 = Black
-            for (int i = 0; i < per_color; ++i) {
-                ChessGame game;
-                MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
-                // play until end
-                while (!game.winner().has_value()) {
-                    if (game.to_play() == color) {
-                        // our agent
-                        auto policy = run_mcts(game, args);
-                        //for (size_t i = 0; i < policy.size(); ++i) {
-                        //    if (policy[i] != 0.0f) {
-                        //        std::cout << i << ": " << policy[i] << "\n";
-                        //    }
-                        //}
-                        auto legal = game.legalMoves();
-                        //std::cout << "[";
-                        //for (size_t i = 0; i < legal.size(); ++i) {
-                        //    std::cout << legal[i];
-                        //    if (i + 1 != legal.size())
-                        //        std::cout << ", ";
-                        //}
-                        //std::cout << "]" << std::endl << std::endl;
+    // 3) shared atomic index for “which game to play next”
+    //    we want total = 2 * num_games_per_color (first half = White‐side games, next half = Black‐side)
+    std::atomic<int> game_idx{0};
 
-                        // pick best move (no noise/exploration)
-                        uint16_t best = legal.front();
-                        float best_p = policy[best];
-                        for (auto a : legal) {
-                            if (policy[a] > best_p) {
-                                best_p = policy[a];
-                                best = a;
-                            }
+    auto worker = [&](int tid) {
+        std::mt19937_64 rng{std::random_device{}()};
+
+        while (true) {
+            int idx = game_idx.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= 2 * num_games_per_color)
+                break;
+
+            // determine color from idx:
+            //   idx in [0 .. num_games_per_color-1]  → play as White
+            //   idx in [num_games_per_color .. 2*num_games_per_color-1] → play as Black
+            int color = (idx < num_games_per_color ? 1 : 0);
+            ChessGame game;
+            MCTArgs args{num_simulations, alpha, epsilon, sampling_moves};
+
+            // play until game over
+            while (!game.winner().has_value()) {
+                if (game.to_play() == color) {
+                    // our agent turn
+                    auto policy = run_mcts(game, args);
+                    auto legal = game.legalMoves();
+                    uint16_t best = legal.front();
+                    float best_p = policy[best];
+                    for (auto a : legal) {
+                        if (policy[a] > best_p) {
+                            best_p = policy[a];
+                            best = a;
                         }
-                        //std::cout << "Best move: " << best << " (p=" << best_p << ") UCI: " 
-                        //<< chess::uci::moveToUci(az73::decode_action(best, game.currentBoard())) << std::endl;
-                        game.makeMove(best);
-                    } else {
-                        // random baseline
-                        auto legal = game.legalMoves();
-                        std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
-                        size_t random_idx = uni(rng);
-                        //std::cout << "Random move UCI: " << chess::uci::moveToUci(az73::decode_action(legal[random_idx], game.currentBoard())) << std::endl;
-                        game.makeMove(legal[random_idx]);
                     }
+                    game.makeMove(best);
+
+                } else {
+                    // random‐move baseline
+                    auto legal = game.legalMoves();
+                    std::uniform_int_distribution<size_t> uni(0, legal.size() - 1);
+                    size_t random_idx = uni(rng);
+                    game.makeMove(legal[random_idx]);
                 }
-                // record result
-                int outcome = *game.winner();  // 1=White,0=Black,-1=draw
-                if (color == 1) {  // we played White
-                    if (outcome == -1)      w_draw++;
-                    else if (outcome == 1)  w_win++;
-                    else                    w_loss++;
-                } else {          // we played Black
-                    if (outcome == -1)      b_draw++;
-                    else if (outcome == 0)  b_win++;
-                    else                    b_loss++;
-                }
+            }
+
+            int outcome = *game.winner();  // 1=White, 0=Black, –1=draw
+            if (color == 1) {
+                // we played White
+                if      (outcome == -1) w_draw++;
+                else if (outcome ==  1) w_win++;
+                else                    w_loss++;
+            } else {
+                // we played Black
+                if      (outcome == -1) b_draw++;
+                else if (outcome ==  0) b_win++;
+                else                    b_loss++;
             }
         }
     };
 
-    // 3) launch threads
-    int per = (num_games_per_color + num_threads - 1) / num_threads;
+    // 4) launch exactly num_threads threads
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back(worker, per);
+        threads.emplace_back(worker, t);
     }
     for (auto &th : threads) th.join();
 
-    // 4) return aggregated results
-    return { w_win.load(), w_loss.load(), w_draw.load(),
-             b_win.load(), b_loss.load(), b_draw.load() };
+    // 5) return aggregated counts
+    return {
+        w_win.load(),  w_loss.load(),  w_draw.load(),
+        b_win.load(),  b_loss.load(),  b_draw.load()
+    };
 }
+
 // --------------------------------------------------------------------
 // Number of floats per record: state (8x8x119) + policy (8x8x73) + z
 static constexpr uint64_t RECORD_FLOATS = 8ULL * 8 * 119 + 8ULL * 8 * 73 + 1;
@@ -162,10 +319,10 @@ void simulate_games_buffered(
         std::signal(SIGINT, handle_sigint);
     });
 
-    std::cerr << "[AZ] simulate_games_buffered: model='" << model_path << "' -> buffer='" << filename << "' cap=" << capacity << "\n";
+
 
     // 1) Load model
-    BatchManager::instance().init(model_path, 16);
+    BatchManager::instance().init(model_path, 64);
 
     py::gil_scoped_release no_gil;
 
@@ -211,6 +368,7 @@ void simulate_games_buffered(
     std::atomic<int> game_idx{0};
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
+
 
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
@@ -368,4 +526,17 @@ PYBIND11_MODULE(chess_engine, m) {
             Run MCTS from the given FEN and return the chosen move (flattened 0–4671).
         )pbdoc"
     ); 
+    m.def("evaluate_vs_stockfish", &az73::evaluate_vs_stockfish,
+      py::arg("model_path"),
+      py::arg("sf_bin"),
+      py::arg("games_per_color"),
+      py::arg("num_threads"),
+      py::arg("sf_depth"),
+      py::arg("sf_elo"),
+      py::arg("num_simulations"),
+      py::arg("alpha"),
+      py::arg("epsilon"),
+      py::arg("sampling_moves"),
+      "Evaluate the AlphaZero agent against Stockfish and return "
+      "(wW,wL,wD,bW,bL,bD).");
 }
