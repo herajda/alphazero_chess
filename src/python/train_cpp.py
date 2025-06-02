@@ -58,11 +58,11 @@ def sample_from_file(path: str, batch_size: int):
 def parse_args():
     parser = argparse.ArgumentParser(description="AlphaZero training with C++ buffered self-play backend")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
-    parser.add_argument("--threads", type=int, default=30, help="Number of C++ self-play threads (and inference batch).")
+    parser.add_argument("--threads", type=int, default=90, help="Number of C++ self-play threads (and inference batch).")
     parser.add_argument("--sim_games", type=int, default=200, help="Number of self-play games per iteration.")
     parser.add_argument("--start_num_simulations", type=int, default=100, help="Initial number of MCTS simulations per move.")
-    parser.add_argument("--end_num_simulations", type=int, default=500, help="Final number of MCTS simulations per move.")
-    parser.add_argument("--num_simulations_steps", type=int, default=100, help="Number of steps over which to linearly decay num_simulations.")
+    parser.add_argument("--end_num_simulations", type=int, default=600, help="Final number of MCTS simulations per move.")
+    parser.add_argument("--num_simulations_steps", type=int, default=200, help="Number of steps over which to linearly decay num_simulations.")
     parser.add_argument("--num_simulations_eval", type=int, default=300, help="Eval num_simulations")
     parser.add_argument("--alpha", type=float, default=0.3, help="Dirichlet alpha for root noise.")
     parser.add_argument("--epsilon", type=float, default=0.25, help="Exploration epsilon for root noise.")
@@ -73,14 +73,14 @@ def parse_args():
     parser.add_argument("--final_learning_rate", type=float, default=0.0001, help="Final learning rate after decay.")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="AdamW weight decay.")
     parser.add_argument("--total_decay_iterations", type=int, default=500, help="Iterations over which to linearly decay the learning rate.")
-    parser.add_argument("--evaluate_each", type=int, default=15, help="Perform evaluation every N iterations.")
-    parser.add_argument("--checkpoint_interval", type=int, default=50, help="Save model checkpoint every N iterations.")
+    parser.add_argument("--evaluate_each", type=int, default=5, help="Perform evaluation every N iterations.")
+    parser.add_argument("--checkpoint_interval", type=int, default=10, help="Save model checkpoint every N iterations.")
     parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum number of training iterations.")
     parser.add_argument("--model_path", type=str, default="model.pt", help="Path to save final model.")
     parser.add_argument("--replay_buffer_capacity", type=int, default=1000000, help="Max on-disk entries in ring buffer.")
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
     parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
-    parser.add_argument("--eval_games_per_color", type=int, default=50, help="Number of eval games per color vs Stockfish and vs Random.")
+    parser.add_argument("--eval_games_per_color", type=int, default=25, help="Number of eval games per color vs Stockfish and vs Random.")
     parser.add_argument("--stockfish_path", type=str, default="/usr/games/stockfish",help="Path to Stockfish binary for ELO evaluation.")
     parser.add_argument("--stockfish_depth", type=int, default=12, help="Search depth for Stockfish during evaluation.")
     parser.add_argument("--stockfish_elo", type=int, default=1320, help="Simulated Elo for Stockfish (via UCI_LimitStrength/UCI_Elo)")
@@ -106,41 +106,63 @@ def spawn_async_evaluation(iteration: int, ts_path: str, args, writer):
         "--sampling",   str(args.sampling_moves),
         "--sf-bin",     args.stockfish_path,
         "--sf-depth",   str(args.stockfish_depth),
-        "--sf-elo",     str(args.stockfish_elo)
+        "--sf-elo",     str(args.stockfish_elo),
+        "--threads",    str(20), 
     ]
 
     def _job():
         try:
             proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            report = json.loads(proc.stdout)        # {'random': {...}, 'stockfish': {...}}
+            report= json.loads(proc.stdout)        # {'random': {...}, 'stockfish': {...}}
+            print(f"EVAL report= {report}")
         except Exception as e:
             print(f"[Eval] worker failed: {e}\ncmd: {' '.join(cmd)}")
             return
 
         # ---------- Random baseline ----------
+# ---------- Random baseline (compute total from the actual JSON counts) ----------
         rnd = report["random"]
-        total = 2 * args.eval_games_per_color
-        win_rate_random = (
-            rnd["wW"] + rnd["bW"] + 0.5 * (rnd["wD"] + rnd["bD"])
-        ) / total
+        white_games = rnd["wW"] + rnd["wL"] + rnd["wD"]
+        black_games = rnd["bW"] + rnd["bL"] + rnd["bD"]
+        total_random_games = white_games + black_games
+        if total_random_games == 0:
+            win_rate_random = 0.0
+        else:
+            win_rate_random = (
+                rnd["wW"] + rnd["bW"] + 0.5 * (rnd["wD"] + rnd["bD"])
+            ) / total_random_games
 
-        # ---------- Stockfish ----------
-        sf = report["stockfish"]
-        win_rate_sf = (sf["W"] + 0.5 * sf["D"]) / total
+        # ---------- Stockfish baseline (again, compute total from JSON) ----------
+        sf_list = report["stockfish"]  # [wW, wL, wD, bW, bL, bD]
+        sf_white_games = sf_list[0] + sf_list[1] + sf_list[2]
+        sf_black_games = sf_list[3] + sf_list[4] + sf_list[5]
+        total_sf_games = sf_white_games + sf_black_games
+        if total_sf_games == 0:
+            win_rate_sf = 0.0
+        else:
+            wins  = sf_list[0] + sf_list[3]  # wW + bW
+            draws = sf_list[2] + sf_list[5]  # wD + bD
+            win_rate_sf = (wins + 0.5 * draws) / total_sf_games
 
-        # Elo vs Stockfish
+        # ---------- Elo vs Stockfish (compute rating difference instead of absolute) ----------
+        # If you want an absolute rating that never dips below zero, you can do:
+        #    elo_diff = 400 * math.log10(win_rate_sf / (1 - win_rate_sf + 1e-12))
+        #    agent_elo = args.stockfish_elo + elo_diff
+        # But if you really only care about “how many Elo points below Stockfish”:
         eps = 1e-4
         p = max(eps, min(1 - eps, win_rate_sf))
-        elo = args.stockfish_elo - 400 * math.log10(1 / p - 1)
+        elo_diff = -400.0 * math.log10(1.0 / p - 1.0)
+        # (This elo_diff is negative when win_rate_sf < 0.5, positive when > 0.5.)
+        agent_elo = args.stockfish_elo + elo_diff
 
         # ---------- log ----------
         writer.add_scalar("Eval/WinRate_vs_Random",   win_rate_random, iteration)
         writer.add_scalar("Eval/WinRate_vs_Stockfish", win_rate_sf,     iteration)
-        writer.add_scalar("Eval/Elo_vs_Stockfish",     elo,            iteration)
+        writer.add_scalar("Eval/Elo_vs_Stockfish",     agent_elo,            iteration)
         writer.flush()
 
         print(f"[Eval] iteration {iteration}: "
-              f"Rnd={win_rate_random:.3f}, SF={win_rate_sf:.3f}, Elo={elo:.0f}")
+              f"Rnd={win_rate_random:.3f}, SF={win_rate_sf:.3f}, Elo={agent_elo:.0f}")
 
     threading.Thread(target=_job, daemon=True).start()
 
@@ -173,7 +195,7 @@ def main():
     # initialize agent (optionally resume)
     if args.resume_model:
         agent = Agent.load(args.resume_model, args)
-        print(f"Resumed model from {args.resume_model}")
+        print(f"Resumed model from {args.resume_model}");
     else:
         agent = Agent(args)
 

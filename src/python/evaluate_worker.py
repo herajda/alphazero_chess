@@ -15,43 +15,25 @@ import chess.engine as uci
 # helpers ------------------------------------------------------------------
 # evaluate_worker.py  (only this function changed)
 
-def eval_vs_random(ts, games, sims, alpha, epsilon, sampling, seed):
-    rng = random.Random(seed)
-    wW=wL=wD=bW=bL=bD = 0
+# evaluate_worker.py
+from chess_engine import evaluate_vs_random, evaluate_vs_stockfish
 
-    for us in (chess.WHITE, chess.BLACK):
-        for _ in range(games):
-            board = chess.Board()
-            while not board.is_game_over(claim_draw=True):
-                if board.turn == us:  # our model
-                    a   = chess_engine.select_move(ts, board.fen(),
-                                                   sims, alpha, epsilon, sampling)
-                    uci = chess_moves.action_to_uci(board, a)
-                    if uci is None:
-                        raise RuntimeError(f"Bad action {a}")
-                    board.push_uci(uci)
-                else:                 # random baseline
-                    board.push(rng.choice(list(board.legal_moves)))
-
-            res = board.result()
-            winner = {"1-0": chess.WHITE, "0-1": chess.BLACK}.get(res)
-
-            if winner is None:           # draw
-                if us == chess.WHITE: wD += 1
-                else:                  bD += 1
-            elif winner == us:           # we won
-                if us == chess.WHITE: wW += 1
-                else:                  bW += 1
-            else:                       # we lost
-                if us == chess.WHITE: wL += 1
-                else:                  bL += 1
-
+def eval_vs_random(ts_path, games, sims, alpha, eps, sampling, threads):
+    wW,wL,wD,bW,bL,bD = evaluate_vs_random(
+        ts_path,
+        games_per_color = games,
+        num_threads     = threads,     # e.g. 16 or 32
+        num_simulations = sims,
+        alpha           = alpha,
+        epsilon         = eps,
+        sampling_moves  = sampling
+    )
     return dict(wW=wW, wL=wL, wD=wD, bW=bW, bL=bL, bD=bD)
 
 
 def eval_vs_stockfish(ts, games, depth, alpha, epsilon, sampling, elo, bin_path):
     eng = uci.SimpleEngine.popen_uci(bin_path)
-    eng.configure({"Threads": 4, "UCI_LimitStrength": True, "UCI_Elo": elo})
+    eng.configure({"Threads": 8, "UCI_LimitStrength": True, "UCI_Elo": elo})
     W=L=D=0
     for us in (chess.WHITE, chess.BLACK):
         for _ in range(games):
@@ -86,15 +68,21 @@ def main():
     p.add_argument("--sf-bin",     type=str,   default="/usr/games/stockfish")
     p.add_argument("--sf-depth",   type=int,   default=12)
     p.add_argument("--sf-elo",     type=int,   default=1320)
+    p.add_argument("--threads",     type=int,   default=8)
     args = p.parse_args()
 
     rnd = eval_vs_random(args.model_ts, args.games, args.sims,
-                         args.alpha, args.epsilon, args.sampling, args.seed)
+                         args.alpha, args.epsilon, args.sampling, args.threads)
 
-    sf  = eval_vs_stockfish(args.model_ts, args.games,
-                            args.sf_depth, args.alpha, args.epsilon,
-                            args.sampling, args.sf_elo, args.sf_bin)
-
+    sf = evaluate_vs_stockfish(
+        args.model_ts,           # TorchScript
+        args.sf_bin,
+        args.games,        # games / colour
+        args.threads,      # new CLI option you can add
+        args.sf_depth,
+        args.sf_elo,
+        args.sims,         # our sims / move
+        args.alpha, args.epsilon, args.sampling)
     # single-line JSON makes parsing trivial
     print(json.dumps({"random": rnd, "stockfish": sf}), flush=True)
 
