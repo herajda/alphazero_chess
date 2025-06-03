@@ -351,7 +351,6 @@ void simulate_games_buffered(
         std::lock_guard lk(file_mtx);
         uint64_t idx = head % capacity;
         uint64_t offset = HEADER_BYTES + idx * RECORD_BYTES;
-        std::cerr << "[AZ] append idx=" << idx << " offset=" << offset << " z=" << z << "\n";
         f.seekp(offset);
         f.write(reinterpret_cast<const char*>(state.data()), state.size() * sizeof(float));
         f.write(reinterpret_cast<const char*>(policy.data()), policy.size() * sizeof(float));
@@ -395,9 +394,15 @@ void simulate_games_buffered(
                 while (!game.winner().has_value()) {
                     // Check for interruption inside game loop
                     if (interrupted) break;
-                    auto tensor = game.encodeTensor();
-                    std::vector<float> flat(tensor.begin(), tensor.end());
+                    auto raw = game.encodeTensor();
+
+                    std::vector<float> flat;
+                    flat.reserve(raw.size());
+                    for (uint8_t b : raw)
+                        flat.push_back(static_cast<float>(b));      // 0.f / 1.f
+
                     auto policy = run_mcts(game, args);
+                    //std::cout << "[AZ] policy size = " << policy.size() << std::endl;
                     auto legal = game.legalMoves();
 
                     std::vector<float> masked(ACTION_SPACE, 0.0f);

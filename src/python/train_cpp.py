@@ -23,35 +23,49 @@ RECORD_BYTES = RECORD_FLOATS * 4    # bytes per record
 HEADER_BYTES = 24                   # bytes for [capacity, size, head]
 
 
+# ── sample_from_file -------------------------------------------------
 def sample_from_file(path: str, batch_size: int):
-    """Randomly sample batch_size entries from the on-disk ring buffer."""
     if not os.path.exists(path):
         return []
+
     with open(path, "rb") as f:
         hdr = f.read(HEADER_BYTES)
         if len(hdr) < HEADER_BYTES:
             return []
+
         capacity, size, head = struct.unpack("<qqq", hdr)
+        print(f"Buffer capacity={capacity}, size={size}, head={head}")
         if size <= 0:
             return []
 
-        # choose random indices among [0, size)
         idxs = random.sample(range(size), k=min(batch_size, size))
         batch = []
+
         for i in idxs:
-            off = HEADER_BYTES + i * RECORD_BYTES
+            phys = (head - size + i) % capacity      # <── NEW
+            off  = HEADER_BYTES + phys * RECORD_BYTES
             f.seek(off)
+
             # read state
-            b = f.read(RECORD_STATE * 4)
-            state = np.frombuffer(b, dtype=np.float32).reshape(119, 8, 8) 
-            state = np.transpose(state, (1, 2, 0))  # reshape to (8, 8, 119)
+            sb = f.read(RECORD_STATE * 4)
+            if len(sb) != RECORD_STATE * 4:          # corrupt/partial – skip
+                continue
+            state = np.frombuffer(sb, dtype=np.float32).reshape((8, 8, 119))  # reshape to (8, 8, 119)
+
             # read policy
             pb = f.read(RECORD_POLICY * 4)
+            if len(pb) != RECORD_POLICY * 4:
+                continue
             policy = np.frombuffer(pb, dtype=np.float32)
+
             # read z
             zb = f.read(4)
+            if len(zb) != 4:
+                continue
             z, = struct.unpack("<f", zb)
+
             batch.append((state, policy, z))
+
     return batch
 
 
