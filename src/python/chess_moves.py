@@ -278,7 +278,7 @@ def board_to_tensor(board):
     tensor[:, :, 112] = 1 if p1 == chess.WHITE else 0
     # Total move count (ply count)
     total_moves = len(board.move_stack)
-    tensor[:, :, 113] = total_moves / 1000.0  # Normalize (assuming max 1000 moves)
+    tensor[:, :, 113] = total_moves
     # P1 castling rights
     tensor[:, :, 114] = 1 if board.has_kingside_castling_rights(p1) else 0
     tensor[:, :, 115] = 1 if board.has_queenside_castling_rights(p1) else 0

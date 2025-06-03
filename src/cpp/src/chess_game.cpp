@@ -131,16 +131,27 @@ namespace {
     using chess::Color;
     using chess::PieceType;
     using chess::Square;
-    constexpr int flat(int plane, int r, int f) { return plane * 64 + r * 8 + f; }
-    inline void fill(float *base, int plane, float v) noexcept { std::fill(base + plane * 64, base + (plane + 1) * 64, v); }
-    inline std::pair<int, int> orient(Square sq, Color view) {
-        int r = static_cast<int>(sq.rank());
-        int f = static_cast<int>(sq.file());
-        if (view == Color::BLACK) {
-            r = 7 - r;
-            f = 7 - f;
-        }
+    //constexpr int flat(int plane, int r, int f) { return plane * 64 + r * 8 + f; }
+    //constexpr int flat(int plane,int r,int f){ return r*8*119 + f*119 + plane; }
+    constexpr int flat(int plane, int r, int f)
+    {   return r * 8 * 119 + f * 119 + plane;   }
+
+
+    inline void fill(float *base, int plane, float v) noexcept
+    {   std::fill(base + plane * 64, base + (plane + 1) * 64, v); }
+
+    inline std::pair<int,int> orient(Square sq, Color p1)
+    {
+        int r = int(sq.rank());
+        int f = int(sq.file());
+        if (p1 == Color::BLACK)   r = 7 - r;          // vertical flip only
         return {r, f};
+    }
+    inline void fillPlane(ChessGame::Tensor &x, int plane, float v) noexcept
+    {
+    for (int r = 0; r < 8; ++r)
+        for (int f = 0; f < 8; ++f)
+            x[flat(plane, r, f)] = v;
     }
 }
 
@@ -165,58 +176,87 @@ void ChessGame::makeMove(const std::uint16_t a) {
     chess::Move m = az73::decode_action(a, currentBoard());
     makeMove(m);
 }
+ChessGame::Tensor ChessGame::encodeTensor() const
+{
+    constexpr int PLANES_PER_STEP = 14;          // 8 steps × 14 planes  = 112
+    constexpr int CONST_BASE      = 8 * PLANES_PER_STEP;   // 112 … 118
 
-ChessGame::Tensor ChessGame::encodeTensor() const {
-    constexpr int PLANES_PER_STEP = 14;
-    Tensor x{};
-    const chess::Board cur = currentBoard();
-    const Color P1 = cur.sideToMove();
-    const Color P2 = (P1 == Color::WHITE ? Color::BLACK : Color::WHITE);
-    for (int t = 0; t < 8; ++t) {
-        int hIdx = static_cast<int>(history_.size()) - 1 - t;
-        if (hIdx < 0) break;
-        const chess::Board b = boardAt(hIdx); 
-        const bool flip = (b.sideToMove() != P1);
-        const Color view = flip ? P2 : P1;
-        const int base = t * PLANES_PER_STEP;
-        auto addPieces = [&](Color c, int planeBase) {
-            using PT = PieceType::underlying;
-            static constexpr PT order[6] = {PT::PAWN, PT::KNIGHT, PT::BISHOP, PT::ROOK, PT::QUEEN, PT::KING};
-            for (int i = 0; i < 6; ++i) {
-                Bitboard bb = b.pieces(PieceType{order[i]}, c);
-                while (bb) {
-                    int idx64 = bb.pop();
-                    Square sq = Square(idx64);
-                    auto [r, f] = orient(sq, view);
-                    x[flat(planeBase + i, r, f)] = 1.0f;
-                }
+    Tensor x{};                                  // all zeros by default
+
+    // ── current players ──────────────────────────────────────────────────────
+    const chess::Board  cur = currentBoard();
+    const chess::Color  P1  = cur.sideToMove();          // player to move now
+    const chess::Color  P2  = (P1 == chess::Color::WHITE ? chess::Color::BLACK
+                                                         : chess::Color::WHITE);
+
+    // ── which 8 positions do we need?  (oldest → newest) ─────────────────────
+    const int total   = int(history_.size());            // inc. initial board
+    const int pad     = total < 8 ? 8 - total : 0;       // “None” slots in front
+    const int start   = total > 8 ? total - 8 : 0;       // drop older boards
+
+    // ── to count repetitions exactly the way Python does it ──────────────────
+    std::unordered_map<std::uint64_t,int> seen_hashes;
+
+    auto addPieces = [&](const chess::Board& b,
+                         chess::Color colour,
+                         int           planeBase)
+    {
+        using PTu = chess::PieceType::underlying;
+        static constexpr PTu ORDER[6] = { PTu::PAWN, PTu::KNIGHT, PTu::BISHOP,
+                                          PTu::ROOK, PTu::QUEEN, PTu::KING };
+
+        for (int i = 0; i < 6; ++i)
+        {
+            Bitboard bb = b.pieces(chess::PieceType{ORDER[i]}, colour);
+            while (bb)
+            {
+                int idx64 = bb.pop();
+                chess::Square sq(idx64);
+                auto [r,f] = orient(sq, P1);            // always from P1’s view
+                x[ flat(planeBase + i, r, f) ] = 1.f;
             }
-        };
-        addPieces(view, base);
-        addPieces(view == P1 ? P2 : P1, base + 6);
-        std::uint64_t h = hashes_[hIdx];
-        int repeats = std::count(hashes_.begin(), hashes_.begin() + hIdx, h);
-        fill(x.data(), base + 12, repeats >= 1 ? 1.0f : 0.0f);
-        fill(x.data(), base + 13, repeats >= 2 ? 1.0f : 0.0f);
-    }
-    constexpr int CONST0 = 8 * PLANES_PER_STEP;
-    fill(x.data(), CONST0 + 0, (P1 == Color::WHITE) ? 1.0f : 0.0f);
-    fill(x.data(), CONST0 + 1, static_cast<float>(cur.fullMoveNumber()));
-    bool p1Ks = false, p1Qs = false, p2Ks = false, p2Qs = false;
-    for (char c : cur.getCastleString()) {
-        switch (c) {
-            case 'K': (P1 == Color::WHITE ? p1Ks : p2Ks) = true; break;
-            case 'Q': (P1 == Color::WHITE ? p1Qs : p2Qs) = true; break;
-            case 'k': (P1 == Color::BLACK ? p1Ks : p2Ks) = true; break;
-            case 'q': (P1 == Color::BLACK ? p1Qs : p2Qs) = true; break;
-            default: break;
         }
+    };
+
+    // ── 8 historical time-steps (t = 0 = oldest … 7 = current) ───────────────
+    for (int t = 0; t < 8; ++t)
+    {
+        if (t < pad)                       // before the game even started
+            continue;                      // → planes stay zero
+
+        const int hIdx = start + (t - pad);
+        const chess::Board b = boardAt(hIdx);
+
+        const int base = t * PLANES_PER_STEP;
+
+        // 0-5 : P1 pieces | 6-11 : P2 pieces
+        addPieces(b, P1, base);
+        addPieces(b, P2, base + 6);
+
+        // repetition plane 12  (count ≥ 2)
+        int cnt = ++seen_hashes[ hashes_[hIdx] ];
+        if (cnt >= 2)
+            fillPlane(x, base + 12, 1.f);
+
+        // plane 13 is left at 0 – exactly what the Python code does
     }
-    fill(x.data(), CONST0 + 2, p1Ks ? 1.0f : 0.0f);
-    fill(x.data(), CONST0 + 3, p1Qs ? 1.0f : 0.0f);
-    fill(x.data(), CONST0 + 4, p2Ks ? 1.0f : 0.0f);
-    fill(x.data(), CONST0 + 5, p2Qs ? 1.0f : 0.0f);
-    fill(x.data(), CONST0 + 6, static_cast<float>(cur.halfMoveClock()));
+
+    // ── constant planes 112 … 118 ────────────────────────────────────────────
+    // ─ historical repetition plane ─
+
+// ─ constant planes 112-118 ─
+    fillPlane(x, CONST_BASE + 0, P1 == chess::Color::WHITE ? 1.f : 0.f);  // 112
+    fillPlane(x, CONST_BASE + 1, float(history_.size() - 1));    // 113
+    using Side = chess::Board::CastlingRights::Side; 
+    const auto cr = cur.castlingRights();                                       // NEW
+    fillPlane(x, CONST_BASE + 2, cr.has(P1, Side::KING_SIDE)  ? 1.f : 0.f); // 114
+    fillPlane(x, CONST_BASE + 3, cr.has(P1, Side::QUEEN_SIDE) ? 1.f : 0.f); // 115
+    fillPlane(x, CONST_BASE + 4, cr.has(P2, Side::KING_SIDE)  ? 1.f : 0.f); // 116
+    fillPlane(x, CONST_BASE + 5, cr.has(P2, Side::QUEEN_SIDE) ? 1.f : 0.f); // 117
+
+    fillPlane(x, CONST_BASE + 6, float(cur.halfMoveClock()) / 50.f);        // 118
+
+
     return x;
 }
 
