@@ -34,7 +34,7 @@ def sample_from_file(path: str, batch_size: int):
             return []
 
         capacity, size, head = struct.unpack("<qqq", hdr)
-        print(f"Buffer capacity={capacity}, size={size}, head={head}")
+        #print(f"Buffer capacity={capacity}, size={size}, head={head}")
         if size <= 0:
             return []
 
@@ -73,7 +73,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="AlphaZero training with C++ buffered self-play backend")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--threads", type=int, default=90, help="Number of C++ self-play threads (and inference batch).")
-    parser.add_argument("--sim_games", type=int, default=200, help="Number of self-play games per iteration.")
+    parser.add_argument("--sim_games", type=int, default=100, help="Number of self-play games per iteration.")
     parser.add_argument("--start_num_simulations", type=int, default=100, help="Initial number of MCTS simulations per move.")
     parser.add_argument("--end_num_simulations", type=int, default=600, help="Final number of MCTS simulations per move.")
     parser.add_argument("--num_simulations_steps", type=int, default=200, help="Number of steps over which to linearly decay num_simulations.")
@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument("--epsilon", type=float, default=0.25, help="Exploration epsilon for root noise.")
     parser.add_argument("--sampling_moves", type=int, default=30, help="Number of moves to sample before switching to greedy.")
     parser.add_argument("--batch_size", type=int, default=400, help="Training batch size.")
-    parser.add_argument("--train_for", type=int, default=120, help="Training steps per iteration.")
+    parser.add_argument("--train_for", type=int, default=55, help="Training steps per iteration.")
     parser.add_argument("--learning_rate", type=float, default=0.0015, help="Initial learning rate.")
     parser.add_argument("--final_learning_rate", type=float, default=0.0001, help="Final learning rate after decay.")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="AdamW weight decay.")
@@ -228,24 +228,24 @@ def main():
         agent._model.train()
         adjust_learning_rate(agent.optimizer, iteration, args)
 
-        batch = sample_from_file("games.bin", args.batch_size)
-        if not batch:
-            print("No games to train on; skipping training")
-        else:
-            for _ in range(args.train_for):
-                boards, policies, zs = map(np.array, zip(*batch))
-                boards_tensor   = torch.tensor(boards,   dtype=torch.float32)
-                policies_tensor = torch.tensor(policies, dtype=torch.float32)
-                zs_tensor       = torch.tensor(zs,       dtype=torch.float32)
-                agent.train(boards_tensor, policies_tensor, zs_tensor)
-            print(f"Training step completed on batch of {len(batch)} entries")
+        batchsize = args.batch_size
+        for step in range(args.train_for):
+            batch = sample_from_file("games.bin", args.batch_size)
+            if not batch:
+                print("No games to train on; skipping training")
+                continue
+            batchsize = len(batch)
+            boards, policies, zs = map(np.array, zip(*batch))
+            boards_tensor   = torch.tensor(boards,   dtype=torch.float32)
+            policies_tensor = torch.tensor(policies, dtype=torch.float32)
+            zs_tensor       = torch.tensor(zs,       dtype=torch.float32)
+            agent.train(boards_tensor, policies_tensor, zs_tensor)
+        print(f"Training step completed on batch of {batchsize} entries")
 
         # save model after each training phase
         agent.save(args.model_path)
         print(f"Saved model to {args.model_path}")
     torch.cuda.empty_cache()
-
-
 
     while training and iteration < args.max_iterations:
         torch.cuda.empty_cache()
@@ -275,21 +275,23 @@ def main():
         print("Generated self-play games into buffer.")
         torch.cuda.empty_cache()
 
-        # training phase
+        # training phase (apply pretrain logic here)
         agent._model.train()
         adjust_learning_rate(agent.optimizer, iteration, args)
 
-        batch = sample_from_file("games.bin", args.batch_size)
-        if not batch:
-            print("No games to train on; skipping training")
-        else:
-            for _ in range(args.train_for):
-                boards, policies, zs = map(np.array, zip(*batch))
-                boards_tensor   = torch.tensor(boards,   dtype=torch.float32)
-                policies_tensor = torch.tensor(policies, dtype=torch.float32)
-                zs_tensor       = torch.tensor(zs,       dtype=torch.float32)
-                agent.train(boards_tensor, policies_tensor, zs_tensor)
-            print(f"Training step completed on batch of {len(batch)} entries")
+        batchsize = args.batch_size
+        for step in range(args.train_for):
+            batch = sample_from_file("games.bin", args.batch_size)
+            if not batch:
+                print("No games to train on; skipping training")
+                continue
+            batchsize = len(batch)
+            boards, policies, zs = map(np.array, zip(*batch))
+            boards_tensor   = torch.tensor(boards,   dtype=torch.float32)
+            policies_tensor = torch.tensor(policies, dtype=torch.float32)
+            zs_tensor       = torch.tensor(zs,       dtype=torch.float32)
+            agent.train(boards_tensor, policies_tensor, zs_tensor)
+        print(f"Training step completed on batch of {batchsize} entries")
 
         # save model after each training phase
         agent.save(args.model_path)
