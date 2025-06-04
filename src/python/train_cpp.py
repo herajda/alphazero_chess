@@ -300,7 +300,7 @@ def main():
         if iteration % args.evaluate_each == 0:
             new_ts = f"model_ts_{iteration}_eval.pt"
             subprocess.run(["python3", "export_torchscript.py", args.model_path, new_ts], check=True)
-            spawn_async_evaluation(iteration, ts_path, args, writer)
+            spawn_async_evaluation(iteration, new_ts, args, writer)
             torch.cuda.empty_cache()
 
         # periodic checkpoint
