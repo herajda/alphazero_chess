@@ -67,6 +67,44 @@ def sample_from_file(path: str, batch_size: int):
             batch.append((state, policy, z))
 
     return batch
+# ──────────────────────────────────────────────────────────────────────
+def load_all_records(path: str):
+    """Return *all* (state, π, z) tuples from the on-disk ring buffer."""
+    if not os.path.exists(path):
+        return []
+
+    records = []
+    with open(path, "rb") as f:
+        hdr = f.read(HEADER_BYTES)
+        if len(hdr) < HEADER_BYTES:
+            return []
+        capacity, size, head = struct.unpack("<qqq", hdr)
+
+        for i in range(size):                                    # logical order
+            phys = (head - size + i) % capacity                  # physical slot
+            off  = HEADER_BYTES + phys * RECORD_BYTES
+            f.seek(off)
+
+            # state 8·8·119
+            sb = f.read(RECORD_STATE * 4)
+            if len(sb) != RECORD_STATE * 4:
+                break
+            state = np.frombuffer(sb, dtype=np.float32).reshape((8, 8, 119))
+
+            # policy 4672
+            pb = f.read(RECORD_POLICY * 4)
+            if len(pb) != RECORD_POLICY * 4:
+                break
+            policy = np.frombuffer(pb, dtype=np.float32)
+
+            # z
+            zb = f.read(4)
+            if len(zb) != 4:
+                break
+            z, = struct.unpack("<f", zb)
+
+            records.append((state, policy, z))
+    return records
 
 
 def parse_args():
@@ -82,7 +120,7 @@ def parse_args():
     parser.add_argument("--epsilon", type=float, default=0.25, help="Exploration epsilon for root noise.")
     parser.add_argument("--sampling_moves", type=int, default=30, help="Number of moves to sample before switching to greedy.")
     parser.add_argument("--batch_size", type=int, default=400, help="Training batch size.")
-    parser.add_argument("--train_for", type=int, default=55, help="Training steps per iteration.")
+    parser.add_argument("--train_for", type=int, default=120, help="Training steps per iteration.")
     parser.add_argument("--learning_rate", type=float, default=0.0015, help="Initial learning rate.")
     parser.add_argument("--final_learning_rate", type=float, default=0.0001, help="Final learning rate after decay.")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="AdamW weight decay.")
@@ -94,6 +132,17 @@ def parse_args():
     parser.add_argument("--replay_buffer_capacity", type=int, default=1000000, help="Max on-disk entries in ring buffer.")
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
     parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
+    # ───────────────── bootstrap / pure-MCTS pretraining ─────────────────
+    parser.add_argument("--bootstrap_games", type=int, default=1000,
+                        help="If >0 run this many self-play games with a "
+                             "uniform dummy network *before* iteration 1.")
+    parser.add_argument("--bootstrap_num_simulations", type=int, default=600)
+    parser.add_argument("--bootstrap_threads", type=int, default=90)
+    parser.add_argument("--bootstrap_train_for", type=int, default=60,
+                        help="SGD steps (on the just generated buffer) "
+                             "before entering the regular loop.")
+    parser.add_argument("--bootstrap_batch_size", type=int, default=256)
+
     parser.add_argument("--eval_games_per_color", type=int, default=25, help="Number of eval games per color vs Stockfish and vs Random.")
     parser.add_argument("--stockfish_path", type=str, default="/usr/games/stockfish",help="Path to Stockfish binary for ELO evaluation.")
     parser.add_argument("--stockfish_depth", type=int, default=12, help="Search depth for Stockfish during evaluation.")
@@ -215,6 +264,60 @@ def main():
 
     iteration = 0
     training = True
+
+    # ───────────────────────── BOOTSTRAP stage ──────────────────────────
+    if args.bootstrap_games > 0:
+
+        # (a) prepare dummy TorchScript once
+        if not os.path.exists("dummy_model.pt"):
+            subprocess.run(["python3", "dummy_model.py",
+                            "dummy_model.pt"], check=True)
+
+        # (b) generate pure-MCTS games
+        print(f"[bootstrap] generating {args.bootstrap_games} games "
+              f"({args.bootstrap_num_simulations} sims, "
+              f"{args.bootstrap_threads} threads, uniform priors)")
+
+        chess_engine.simulate_games_buffered(
+            "dummy_model.pt",
+            num_games      = args.bootstrap_games,
+            num_threads    = args.bootstrap_threads,
+            num_simulations= args.bootstrap_num_simulations,
+            alpha          = args.alpha,
+            epsilon        = args.epsilon,
+            sampling_moves = args.sampling_moves,
+            filename       = "games.bin",
+            replay_buffer_capacity = args.replay_buffer_capacity
+        )
+        # (c) load ALL records, shuffle once, train epoch-style
+        print("[bootstrap] loading all records into memory …")
+        records = load_all_records("games.bin")
+        if not records:
+            raise RuntimeError("games.bin is empty – bootstrap failed.")
+
+        rng = np.random.default_rng(args.seed)
+        rng.shuffle(records)
+        print(f"[bootstrap] training on {len(records)} positions "
+              f"in batches of {args.bootstrap_batch_size}")
+
+        agent._model.train()
+        for i in range(0, len(records), args.bootstrap_batch_size):
+            batch = records[i : i + args.bootstrap_batch_size]
+            boards, policies, zs = map(np.array, zip(*batch))
+            agent.train(torch.tensor(boards,   dtype=torch.float32),
+                        torch.tensor(policies, dtype=torch.float32),
+                        torch.tensor(zs,       dtype=torch.float32))
+
+        # (d) clean up – free disk space
+        try:
+            os.remove("games.bin")
+            print("[bootstrap] games.bin removed")
+        except FileNotFoundError:
+            pass
+
+        # (d) save & continue with normal loop
+        agent.save(args.model_path)
+        print("[bootstrap] done – switching to network-guided training")
 
     # evaluate the model before training
     if args.resume_model:
