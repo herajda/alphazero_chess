@@ -198,3 +198,7 @@ runs/
 build/
 build-debug/
 
+# Include chess-library submodule
+!lib/
+!lib/chess-library/
+
