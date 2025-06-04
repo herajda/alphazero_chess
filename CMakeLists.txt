@@ -50,7 +50,7 @@ find_package(Torch REQUIRED)
 # Includes
 include_directories(
   ${CMAKE_SOURCE_DIR}/src/cpp/include
-  ${CMAKE_SOURCE_DIR}/lib/chess-library
+  ${CMAKE_SOURCE_DIR}/lib/chess-library/include
   ${TORCH_INCLUDE_DIRS}
   ${Python3_INCLUDE_DIRS}
 )
