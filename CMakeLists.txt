@@ -23,24 +23,7 @@ set(CMAKE_CXX_FLAGS_RELEASE
 
 
 # 5) GPU architecture for LibTorch
-# Try to use environment variable `TORCH_CUDA_ARCH_LIST` if provided.
-# Otherwise attempt to detect the compute capability of the first CUDA device
-# via a short Python snippet. When detection fails, leave the variable unset
-# so LibTorch can decide a suitable default.
-if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
-  set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
-else()
-  execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import torch,sys; cc=torch.cuda.get_device_capability(0); print(f'{cc[0]}.{cc[1]}')"
-    RESULT_VARIABLE TORCH_CC_RES
-    OUTPUT_VARIABLE TORCH_CC_OUT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
-  if(TORCH_CC_RES EQUAL 0)
-    set(TORCH_CUDA_ARCH_LIST "${TORCH_CC_OUT}")
-  endif()
-endif()
+set(TORCH_CUDA_ARCH_LIST "8.9")
 
 # Pull in Python & PyBind11 & Torch
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
@@ -61,6 +44,7 @@ add_library(chess_engine MODULE
   src/cpp/src/mcts.cpp
   src/cpp/src/batch_manager.cpp
   src/cpp/src/simulate.cpp
+  lib/chess-library/include/chess.hpp 
 )
 
 target_link_libraries(chess_engine PRIVATE

@@ -398,7 +398,7 @@ void simulate_games_buffered(
 
                     std::vector<float> flat;
                     flat.reserve(raw.size());
-                    for (uint8_t b : raw)
+                    for (uint16_t b : raw)
                         flat.push_back(static_cast<float>(b));      // 0.f / 1.f
 
                     auto policy = run_mcts(game, args);

@@ -129,7 +129,7 @@ def parse_args():
     parser.add_argument("--checkpoint_interval", type=int, default=10, help="Save model checkpoint every N iterations.")
     parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum number of training iterations.")
     parser.add_argument("--model_path", type=str, default="model.pt", help="Path to save final model.")
-    parser.add_argument("--replay_buffer_capacity", type=int, default=1000000, help="Max on-disk entries in ring buffer.")
+    parser.add_argument("--replay_buffer_capacity", type=int, default=200000, help="Max on-disk entries in ring buffer.")
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
     parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
     # ───────────────── bootstrap / pure-MCTS pretraining ─────────────────
@@ -142,6 +142,7 @@ def parse_args():
                         help="SGD steps (on the just generated buffer) "
                              "before entering the regular loop.")
     parser.add_argument("--bootstrap_batch_size", type=int, default=256)
+    parser.add_argument("--bootstrap_replay_buffer_capacity", type=int, default=900000, help="Max on-disk entries in ring buffer.")
 
     parser.add_argument("--eval_games_per_color", type=int, default=25, help="Number of eval games per color vs Stockfish and vs Random.")
     parser.add_argument("--stockfish_path", type=str, default="/usr/games/stockfish",help="Path to Stockfish binary for ELO evaluation.")
@@ -287,7 +288,7 @@ def main():
             epsilon        = args.epsilon,
             sampling_moves = args.sampling_moves,
             filename       = "games.bin",
-            replay_buffer_capacity = args.replay_buffer_capacity
+            replay_buffer_capacity = args.bootstrap_replay_buffer_capacity
         )
         # (c) load ALL records, shuffle once, train epoch-style
         print("[bootstrap] loading all records into memory …")

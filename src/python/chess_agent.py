@@ -208,6 +208,7 @@ class Agent:
         torch.save(self._model.state_dict(), path)
 
     def train(self, boards: torch.Tensor, target_policies: torch.Tensor, target_values: torch.Tensor) -> None:
+        self._model.train()
         boards = boards.to(self.device)
         target_policies = target_policies.to(self.device)
         target_values = target_values.to(self.device)
