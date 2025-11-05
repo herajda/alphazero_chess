@@ -20,9 +20,9 @@ namespace az73 {
  */
 void simulate_games_buffered(
     const std::string &model_path,
-    int num_games,
-    int num_threads,
-    int num_simulations,
+   int num_games,
+   int num_threads,
+   int num_simulations,
     double alpha,
     double epsilon,
     int sampling_moves,
@@ -42,6 +42,18 @@ evaluate_vs_stockfish(
     double alpha, double epsilon,
     int sampling_moves
 );
+
+void convert_pgn_to_supervised_buffer(const std::string &pgn_path,
+                                      const std::string &output_path,
+                                      std::int64_t max_games);
+
+py::list sample_supervised_batch(const std::string &buffer_path, int batch_size);
+py::list sample_supervised_batch_v2(const std::string &buffer_path,
+                                    int batch_size,
+                                    std::size_t shuffle_buffer_size,
+                                    std::int64_t seed);
+
+std::int64_t supervised_buffer_size(const std::string &buffer_path);
 
 
 } // namespace az73
