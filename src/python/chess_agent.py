@@ -1,5 +1,6 @@
 import argparse
 import collections
+import logging
 import os
 
 import math
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from multiprocessing import Pool
+from torch.cuda.amp import GradScaler, autocast
 from chess_game import ChessGame  
 
 import warnings
@@ -33,6 +35,19 @@ parser.add_argument("--final_learning_rate", default=0.0001, type=float, help="F
 parser.add_argument("--weight_decay", default=0.001, type=float, help="Weight decay for AdamW.")
 parser.add_argument("--total_decay_iterations", default=100, type=int, help="Total iterations over which the learning rate will decay linearly.")
 parser.add_argument("--infer", default=False, type=bool, help="Inference mode ON or OFF.")
+parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16",
+                    help="Numeric precision for model inputs/activations (weights stay FP32).")
+parser.add_argument("--compile", dest="compile", action="store_true",
+                    help="Enable torch.compile for the transformer model.")
+parser.add_argument("--no-compile", dest="compile", action="store_false",
+                    help="Disable torch.compile.")
+parser.add_argument("--compile-backend", type=str, default=None,
+                    help="Optional backend to pass to torch.compile (e.g., 'inductor').")
+parser.add_argument("--compile-mode", type=str, default="default",
+                    help="torch.compile mode to use (e.g., 'default', 'reduce-overhead', 'max-autotune').")
+parser.add_argument("--compile-fullgraph", action="store_true",
+                    help="Request fullgraph=True when compiling (experimental).")
+parser.set_defaults(compile=False)
 
 class ReplayBuffer:
     """Simple replay buffer with possibly limited capacity."""
@@ -126,8 +141,10 @@ class Agent:
                     num_layers=self.num_layers
                 )
 
-                # --- Policy head (same pattern as before) ---
+                self.use_policy_1x1 = True
+                # --- Policy head (keeps legacy conv+dense for backward compatibility) ---
                 self.policy_conv    = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
+                self.policy_1x1 = nn.Conv2d(self.dim_model, 73, kernel_size=1, bias=False)  # [B,73,8,8]
                 self.policy_flatten = nn.Flatten()
                 self.policy_dense   = nn.Linear(2 * self.board_size * self.board_size,
                                                 self.num_actions)
@@ -182,55 +199,167 @@ class Agent:
                                            self.board_size)  # [B,1024,8,8]
 
                 # --- Policy Head ---
-                px = self.policy_conv(x)             # [B,2,8,8]
-                px = self.policy_flatten(px)         # [B, 128]
-                policy = F.softmax(self.policy_dense(px), dim=-1)  # [B,4672]
-
+                if self.use_policy_1x1:
+                    logits_73_8x8 = self.policy_1x1(x)
+                    policy_logits = logits_73_8x8.permute(0, 2, 3, 1).contiguous() # [B,8,8,73]
+                    policy_logits = policy_logits.view(bsz, 64*73) # [B,4672]
+                else:
+                    px = self.policy_conv(x)
+                    px = self.policy_flatten(px)
+                    policy_logits = self.policy_dense(px)
                 # --- Value Head ---
                 vx = self.value_conv(x)              # [B,1,8,8]
                 vx = self.value_flatten(vx)          # [B, 64]
                 value = torch.tanh(self.value_dense(vx))           # [B,1]
 
-                return policy, value
+                return policy_logits, value
 
 
+        self._compiled = False
         self._model = TransformerModel(args).to(self.device)
+        self._maybe_compile_model(args)
+        requested_precision = getattr(args, "precision", "bf16")
+        self.precision = requested_precision.lower()
+        self.use_fp16 = self.precision == "fp16" and self.device.type == "cuda"
+        bf16_supported = (
+            self.device.type == "cuda"
+            and torch.cuda.is_available()
+            and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        )
+        self.use_bf16 = self.precision == "bf16" and bf16_supported
+        if self.precision == "fp16" and not self.use_fp16:
+            logging.warning("FP16 requested but CUDA is unavailable; defaulting to FP32.")
+        if self.precision == "bf16" and not self.use_bf16:
+            logging.warning("BF16 requested but hardware lacks support; defaulting to FP32.")
+        self.dtype = torch.float32
+        self.autocast_dtype = None
+        if self.use_fp16:
+            self.dtype = torch.float16
+            self.autocast_dtype = torch.float16
+        elif self.use_bf16:
+            self.dtype = torch.bfloat16
+            self.autocast_dtype = torch.bfloat16
+        self._model = self._model.to(self.device)
         print(f"Model parameters: {sum(p.numel() for p in self._model.parameters())}")
         self.optimizer = torch.optim.AdamW(self._model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        self.scaler = GradScaler(enabled=self.use_fp16)
+
+    @staticmethod
+    def _unwrap_compiled_model(model: nn.Module) -> nn.Module:
+        return getattr(model, "_orig_mod", model)
+
+    @staticmethod
+    def _strip_compile_prefix(state_dict: collections.OrderedDict) -> collections.OrderedDict:
+        """Remove torch.compile's '_orig_mod.' prefix if present in a state_dict."""
+        prefix = "_orig_mod."
+        if not any(key.startswith(prefix) for key in state_dict.keys()):
+            return state_dict
+        cleaned = collections.OrderedDict()
+        for key, value in state_dict.items():
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+            cleaned[key] = value
+        return cleaned
 
     @classmethod
     def load(cls, path: str, args) -> "Agent":
         agent = Agent(args)
-        agent._model.load_state_dict(torch.load(path, map_location=agent.device))
+        state = torch.load(path, map_location=agent.device)
+        state = cls._strip_compile_prefix(state)
+        base_model = cls._unwrap_compiled_model(agent._model)
+        if "policy_1x1.weight" not in state:
+            logging.warning(
+                "Checkpoint does not contain policy_1x1 weights; enabling legacy policy head."
+            )
+            # Seed the missing weight with the freshly initialized tensor so load_state_dict succeeds.
+            default_state = base_model.state_dict()
+            state = collections.OrderedDict(state)
+            state["policy_1x1.weight"] = default_state["policy_1x1.weight"].detach().clone()
+            base_model.use_policy_1x1 = False
+        agent._model.load_state_dict(state)
+        agent._model = agent._model.to(agent.device)
         return agent
 
     def save(self, path: str) -> None:
-        torch.save(self._model.state_dict(), path)
+        state = self._strip_compile_prefix(self._model.state_dict())
+        torch.save(state, path)
 
-    def train(self, boards: torch.Tensor, target_policies: torch.Tensor, target_values: torch.Tensor) -> None:
+    def _maybe_compile_model(self, args) -> None:
+        self._compiled = False
+        if not bool(getattr(args, "compile", False)):
+            return
+        if not hasattr(torch, "compile"):
+            logging.warning("torch.compile requested but this PyTorch build does not provide torch.compile; skipping.")
+            return
+
+        compile_kwargs: dict[str, object] = {}
+        backend = getattr(args, "compile_backend", None)
+        if backend:
+            compile_kwargs["backend"] = backend
+        mode = getattr(args, "compile_mode", None)
+        if mode:
+            compile_kwargs["mode"] = mode
+        if bool(getattr(args, "compile_fullgraph", False)):
+            compile_kwargs["fullgraph"] = True
+
+        try:
+            self._model = torch.compile(self._model, **compile_kwargs)
+            self._compiled = True
+            logging.info(
+                "torch.compile enabled%s",
+                f" with kwargs={compile_kwargs}" if compile_kwargs else "",
+            )
+        except Exception as exc:
+            logging.warning("torch.compile failed (%s); continuing with eager model.", exc)
+
+    def train(self, boards: torch.Tensor, target_policies: torch.Tensor, target_values: torch.Tensor) -> [float, float, float]:
         self._model.train()
-        boards = boards.to(self.device)
-        target_policies = target_policies.to(self.device)
-        target_values = target_values.to(self.device)
-        
-        policy, value = self._model(boards)
-        value = value.squeeze(-1)
-        loss_policy = -torch.sum(target_policies * torch.log(policy + 1e-8), dim=1).mean()
-        loss_value = F.mse_loss(value, target_values)
-        loss = loss_policy + loss_value
-        
+        boards = boards.to(self.device, dtype=self.dtype)
+        target_policies = target_policies.to(self.device, dtype=self.dtype)
+        target_values = target_values.to(self.device, dtype=self.dtype)
+
+        autocast_kwargs = {"enabled": self.autocast_dtype is not None}
+        if self.autocast_dtype is not None:
+            autocast_kwargs["dtype"] = self.autocast_dtype
+        with autocast(**autocast_kwargs):
+            policy_logits, value = self._model(boards)
+
+            value = value.squeeze(-1)
+
+            logp = F.log_softmax(policy_logits.float(), dim=-1)
+            targets_policy = target_policies.float()
+            loss_policy = -(targets_policy * logp).sum(dim=-1).mean()
+
+            value_fp32 = value.float()
+            targets_value = target_values.float()
+            loss_value = F.mse_loss(value_fp32, targets_value)
+
+            loss = loss_policy + loss_value
+
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        if self.scaler.is_enabled():
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
+        
+        return loss_policy.item(), loss_value.item(), loss.item()
 
     def predict(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if type(boards) is not torch.Tensor: 
-            boards = torch.from_numpy(boards).float()
-        boards = boards.to(self.device)
+            boards = torch.from_numpy(boards)
+        boards = boards.to(self.device, dtype=self.dtype)
         self._model.eval()
         with torch.no_grad():
-            policy, value = self._model(boards)
-        return policy.detach().cpu().numpy(), value.detach().cpu().numpy()
+            autocast_kwargs = {"enabled": self.autocast_dtype is not None}
+            if self.autocast_dtype is not None:
+                autocast_kwargs["dtype"] = self.autocast_dtype
+            with autocast(**autocast_kwargs):
+                policy_logits, value = self._model(boards)
+                policy_probs = F.softmax(policy_logits, dim=-1)
+        return policy_probs.float().detach().cpu().numpy(), value.float().detach().cpu().numpy()
 
     def board(self, game) -> torch.Tensor:
         #if game.to_play != 0:

@@ -125,6 +125,8 @@ def parse_args():
     parser.add_argument("--final_learning_rate", type=float, default=0.0001, help="Final learning rate after decay.")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="AdamW weight decay.")
     parser.add_argument("--total_decay_iterations", type=int, default=500, help="Iterations over which to linearly decay the learning rate.")
+    parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16",
+                        help="Computation precision for the agent (fp16/bf16 require compatible CUDA).")
     parser.add_argument("--evaluate_each", type=int, default=5, help="Perform evaluation every N iterations.")
     parser.add_argument("--checkpoint_interval", type=int, default=10, help="Save model checkpoint every N iterations.")
     parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum number of training iterations.")
@@ -305,9 +307,9 @@ def main():
         for i in range(0, len(records), args.bootstrap_batch_size):
             batch = records[i : i + args.bootstrap_batch_size]
             boards, policies, zs = map(np.array, zip(*batch))
-            agent.train(torch.tensor(boards,   dtype=torch.float32),
-                        torch.tensor(policies, dtype=torch.float32),
-                        torch.tensor(zs,       dtype=torch.float32))
+            agent.train(torch.tensor(boards,   dtype=agent.dtype),
+                        torch.tensor(policies, dtype=agent.dtype),
+                        torch.tensor(zs,       dtype=agent.dtype))
 
         # (d) clean up – free disk space
         try:
@@ -340,9 +342,9 @@ def main():
                 continue
             batchsize = len(batch)
             boards, policies, zs = map(np.array, zip(*batch))
-            boards_tensor   = torch.tensor(boards,   dtype=torch.float32)
-            policies_tensor = torch.tensor(policies, dtype=torch.float32)
-            zs_tensor       = torch.tensor(zs,       dtype=torch.float32)
+            boards_tensor   = torch.tensor(boards,   dtype=agent.dtype)
+            policies_tensor = torch.tensor(policies, dtype=agent.dtype)
+            zs_tensor       = torch.tensor(zs,       dtype=agent.dtype)
             agent.train(boards_tensor, policies_tensor, zs_tensor)
         print(f"Training step completed on batch of {batchsize} entries")
 
@@ -391,9 +393,9 @@ def main():
                 continue
             batchsize = len(batch)
             boards, policies, zs = map(np.array, zip(*batch))
-            boards_tensor   = torch.tensor(boards,   dtype=torch.float32)
-            policies_tensor = torch.tensor(policies, dtype=torch.float32)
-            zs_tensor       = torch.tensor(zs,       dtype=torch.float32)
+            boards_tensor   = torch.tensor(boards,   dtype=agent.dtype)
+            policies_tensor = torch.tensor(policies, dtype=agent.dtype)
+            zs_tensor       = torch.tensor(zs,       dtype=agent.dtype)
             agent.train(boards_tensor, policies_tensor, zs_tensor)
         print(f"Training step completed on batch of {batchsize} entries")
 

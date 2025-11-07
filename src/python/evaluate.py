@@ -64,12 +64,19 @@ if __name__ == '__main__':
         '--seed', type=int, default=None,
         help='Random seed for the random player'
     )
+    parser.add_argument(
+        '--precision',
+        choices=('fp32', 'fp16', 'bf16'),
+        default='bf16',
+        help='Computation precision for loading the model (fp16/bf16 require compatible CUDA).'
+    )
     args = parser.parse_args()
 
     # Prepare agent arguments for inference
     agent_args = chess_agent.parser.parse_args([])
     agent_args.infer = True
     agent_args.model_path = args.model_path
+    agent_args.precision = args.precision
 
     # Load the agent and wrap in a Player
     agent = Agent.load(args.model_path, agent_args)

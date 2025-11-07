@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler, autocast
 
 import chess_engine
 from chess_agent import Agent
@@ -37,7 +38,7 @@ def parse_args() -> argparse.Namespace:
                         help="Output path for the binary supervised buffer.")
     parser.add_argument("--max-games", type=int, default=200_000,
                         help="Limit the number of PGN games to ingest (-1 for all).")
-    parser.add_argument("--batch-size", type=int, default=896)
+    parser.add_argument("--batch-size", type=int, default=1536)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--steps-per-epoch", type=int, default=0,
                         help="Training steps per epoch (0 → computed from dataset size).")
@@ -47,7 +48,7 @@ def parse_args() -> argparse.Namespace:
                         help="Gradient clipping value (<=0 disables clipping).")
     parser.add_argument("--value-loss-weight", type=float, default=1.0,
                         help="Weight for the value head MSE component.")
-    parser.add_argument("--log-interval", type=int, default=1,
+    parser.add_argument("--log-interval", type=int, default=50,
                         help="Steps between logging updates.")
     parser.add_argument("--logdir", type=Path, default=None,
                         help="Optional TensorBoard log directory.")
@@ -66,6 +67,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int )
     parser.add_argument("--resume", action="store_true",
                         help="Resume from an existing model checkpoint if available.")
+    parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16",
+                        help="Computation precision for training (fp16/bf16 require compatible CUDA).")
+    parser.add_argument("--compile", dest="compile", action="store_true",
+                        help="Enable torch.compile for the model (default).")
+    parser.add_argument("--no-compile", dest="compile", action="store_false",
+                        help="Disable torch.compile even if available.")
+    parser.add_argument("--compile-backend", type=str, default=None,
+                        help="Optional backend to pass to torch.compile (e.g., 'inductor').")
+    parser.add_argument("--compile-mode", type=str, default="default",
+                        help="torch.compile mode to use (e.g., 'default', 'reduce-overhead', 'max-autotune').")
+    parser.add_argument("--compile-fullgraph", action="store_true",
+                        help="Request fullgraph=True when compiling (experimental).")
+    parser.set_defaults(compile=True)
     return parser.parse_args()
 
 
@@ -183,14 +197,20 @@ class BatchPrefetcher:
         self.executor.shutdown(wait=True)
 
 
-def batch_to_tensors(batch, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    states = np.stack([np.asarray(sample[0], dtype=np.float32) for sample in batch], axis=0)
+def batch_to_tensors(batch, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if dtype == torch.float16:
+        np_dtype = np.float16
+    elif dtype == torch.bfloat16 and hasattr(np, "bfloat16"):
+        np_dtype = np.bfloat16  # type: ignore[attr-defined]
+    else:
+        np_dtype = np.float32
+    states = np.stack([np.asarray(sample[0], dtype=np_dtype) for sample in batch], axis=0)
     actions = np.fromiter((int(sample[1]) for sample in batch), dtype=np.int64)
-    values = np.fromiter((float(sample[2]) for sample in batch), dtype=np.float32)
+    values = np.fromiter((float(sample[2]) for sample in batch), dtype=np_dtype)
 
-    state_tensor = torch.from_numpy(states).to(device=device, dtype=torch.float32)
+    state_tensor = torch.from_numpy(states).to(device=device, dtype=dtype)
     action_tensor = torch.from_numpy(actions).to(device=device, dtype=torch.long)
-    value_tensor = torch.from_numpy(values).to(device=device, dtype=torch.float32)
+    value_tensor = torch.from_numpy(values).to(device=device, dtype=dtype)
     return state_tensor, action_tensor, value_tensor
 
 
@@ -199,6 +219,7 @@ def maybe_load_checkpoint(agent: Agent, model_path: Path, resume: bool) -> None:
         logging.info("Loading checkpoint from %s", model_path)
         state = torch.load(model_path, map_location=agent.device)
         agent._model.load_state_dict(state)
+        agent._model = agent._model.to(agent.device)
 
 
 def train_supervised(args: argparse.Namespace) -> None:
@@ -229,11 +250,15 @@ def train_supervised(args: argparse.Namespace) -> None:
     )
 
     device = agent.device
+    scaler: GradScaler = agent.scaler
+    use_scaler = scaler is not None and scaler.is_enabled()
+    autocast_enabled = agent.autocast_dtype is not None
     global_step = 0
     try:
         for epoch in range(1, args.epochs + 1):
             agent._model.train()
-            running_loss = running_policy = running_value = running_acc = 0.0
+
+            running_loss = running_policy = running_value  = 0.0
             running_actions = 0
             running_time = 0.0
             running_fetch = 0.0
@@ -248,32 +273,27 @@ def train_supervised(args: argparse.Namespace) -> None:
                     continue
                 fetch_duration = time.perf_counter() - fetch_start
 
-                states, actions, targets = batch_to_tensors(batch, device)
-                agent.optimizer.zero_grad(set_to_none=True)
+                states, actions, targets = batch_to_tensors(batch, device, agent.dtype)
+
+                # Build policy targets as one-hot vectors matching the action space
+                num_actions = agent._model.num_actions if hasattr(agent._model, "num_actions") else None
+                if num_actions is None:
+                    # Fallback: infer from model output by a quick forward pass
+                    with torch.no_grad():
+                        tmp_logits, _ = agent._model(states[:1])
+                        num_actions = tmp_logits.shape[-1]
+                policy_targets = F.one_hot(actions, num_classes=num_actions).to(dtype=states.dtype)
 
                 compute_start = time.perf_counter()
-                policy_pred, value_pred = agent._model(states)
-                value_pred = value_pred.squeeze(-1)
+                # Perform training step via Agent to trigger internal DEBUG prints
 
-                log_probs = torch.log(policy_pred + 1e-8)
-                policy_loss = F.nll_loss(log_probs, actions)
-                value_loss = F.mse_loss(value_pred, targets)
-                loss = policy_loss + args.value_loss_weight * value_loss
-
-                loss.backward()
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(agent._model.parameters(), args.grad_clip)
-                agent.optimizer.step()
+                policy_loss, value_loss, loss = agent.train(states, policy_targets, targets)
                 compute_duration = time.perf_counter() - compute_start
 
-                with torch.no_grad():
-                    predictions = policy_pred.argmax(dim=1)
-                    accuracy = (predictions == actions).float().mean().item()
 
-                running_loss += loss.item()
-                running_policy += policy_loss.item()
-                running_value += value_loss.item()
-                running_acc += accuracy
+                running_loss += float(loss)
+                running_policy += float(policy_loss)
+                running_value += float(value_loss)
                 running_actions += actions.numel()
                 running_time += time.perf_counter() - step_start
                 running_fetch += fetch_duration
@@ -285,23 +305,21 @@ def train_supervised(args: argparse.Namespace) -> None:
                     log_loss = running_loss * scale
                     log_policy = running_policy * scale
                     log_value = running_value * scale
-                    log_acc = running_acc * scale
                     actions_per_sec = running_actions / running_time if running_time > 0 else 0.0
                     avg_fetch = running_fetch * scale
                     avg_compute = running_compute * scale
                     logging.info(
-                        "epoch %d/%d | step %d/%d | loss=%.4f | policy=%.4f | value=%.4f | acc=%.3f | actions/s=%.1f | fetch=%.3fs | compute=%.3fs",
-                        epoch, args.epochs, step, steps_per_epoch, log_loss, log_policy, log_value, log_acc, actions_per_sec, avg_fetch, avg_compute,
+                        "epoch %d/%d | step %d/%d | loss=%.4f | policy=%.4f | value=%.4f | actions/s=%.1f | fetch=%.3fs | compute=%.3fs",
+                        epoch, args.epochs, step, steps_per_epoch, log_loss, log_policy, log_value, actions_per_sec, avg_fetch, avg_compute,
                     )
                     if writer:
                         writer.add_scalar("train/loss", log_loss, global_step)
                         writer.add_scalar("train/policy_loss", log_policy, global_step)
                         writer.add_scalar("train/value_loss", log_value, global_step)
-                        writer.add_scalar("train/accuracy", log_acc, global_step)
                         writer.add_scalar("train/actions_per_second", actions_per_sec, global_step)
                         writer.add_scalar("train/fetch_time_sec", avg_fetch, global_step)
                         writer.add_scalar("train/compute_time_sec", avg_compute, global_step)
-                    running_loss = running_policy = running_value = running_acc = 0.0
+                    running_loss = running_policy = running_value = 0.0
                     running_actions = 0
                     running_time = 0.0
                     running_fetch = 0.0

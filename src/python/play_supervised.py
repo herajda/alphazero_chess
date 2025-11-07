@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 
 import chess_agent
 from chess_agent import Agent
@@ -59,15 +60,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable Tkinter board GUI alongside the terminal view.",
     )
+    parser.add_argument(
+        "--precision",
+        choices=("fp32", "fp16", "bf16"),
+        default="bf16",
+        help="Computation precision to load the model with (fp16/bf16 require compatible CUDA).",
+    )
     return parser.parse_args()
 
 
-def load_agent(model_path: Path) -> tuple[Agent, argparse.Namespace]:
+def load_agent(model_path: Path, precision: str) -> tuple[Agent, argparse.Namespace]:
     """Instantiate an Agent in inference mode and load weights from disk."""
     agent_args = chess_agent.parser.parse_args([])
     agent_args.infer = True
     agent_args.model_path = str(model_path)
     agent_args.num_simulations = 0  # rely on direct policy predictions
+    agent_args.precision = precision
     agent = Agent.load(str(model_path), agent_args)
     return agent, agent_args
 
@@ -80,7 +88,13 @@ def select_agent_action(
 ) -> int:
     """Sample or pick the agent move from the policy head."""
     # Agent expects a tensor with shape [1, 8, 8, 119]
-    board_tensor = agent.board(game).astype(np.float32, copy=False)[np.newaxis]
+    if agent.dtype == torch.float16:
+        np_dtype = np.float16
+    elif agent.dtype == torch.bfloat16 and hasattr(np, "bfloat16"):
+        np_dtype = np.bfloat16  # type: ignore[attr-defined]
+    else:
+        np_dtype = np.float32
+    board_tensor = agent.board(game).astype(np_dtype, copy=False)[np.newaxis]
     policy, _ = agent.predict(board_tensor)
     policy = policy[0]
 
@@ -160,7 +174,7 @@ def main() -> int:
         print(f"Model path '{model_path}' does not exist.", file=sys.stderr)
         return 1
 
-    agent, _ = load_agent(model_path)
+    agent, _ = load_agent(model_path, args.precision)
     rng = np.random.default_rng(args.seed)
 
     game = ChessGame(gui_enabled=args.gui)

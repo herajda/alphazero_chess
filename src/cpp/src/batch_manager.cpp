@@ -41,7 +41,12 @@ void BatchManager::init(const std::string& model_path, size_t batch_size) {
     module_ = torch::jit::freeze(module_);
     module_ = torch::jit::optimize_for_inference(module_);
     device_ = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
-    module_.to(device_);
+    module_dtype_ = torch::kFloat32;
+    for (const auto& named_param : module_.named_parameters()) {
+        module_dtype_ = named_param.value.scalar_type();
+        break;
+    }
+    module_.to(device_, module_dtype_);
     batch_size_ = batch_size;
     current_path_ = model_path;
     running_ = true;
@@ -86,11 +91,11 @@ void BatchManager::run_loop() {
         for (size_t i = 0; i < B; ++i) {
             std::memcpy(ptr + i * 8 * 8 * 119, batch[i]->tensor.data(), 8 * 8 * 119 * sizeof(float));
         }
-        input = input.to(device_);
+        input = input.to(device_, module_dtype_);
         torch::InferenceMode guard;
         auto outputs = module_.forward({input}).toTuple();
-        at::Tensor pol_t = outputs->elements()[0].toTensor().to(torch::kCPU);
-        at::Tensor val_t = outputs->elements()[1].toTensor().to(torch::kCPU);
+        at::Tensor pol_t = outputs->elements()[0].toTensor().to(torch::kCPU, torch::kFloat32);
+        at::Tensor val_t = outputs->elements()[1].toTensor().to(torch::kCPU, torch::kFloat32);
         auto pol_acc = pol_t.accessor<float,2>();
         auto val_acc = val_t.accessor<float,2>();
         for (size_t i = 0; i < B; ++i) {

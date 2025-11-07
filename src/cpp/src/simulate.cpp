@@ -827,7 +827,9 @@ struct UciEngine {
 
     explicit UciEngine(const std::string &path) : bin(path) {
         int in_pipe [2], out_pipe[2];
-        pipe(in_pipe);  pipe(out_pipe);
+        if (pipe(in_pipe) == -1 || pipe(out_pipe) == -1) {
+            throw std::runtime_error("Failed to create pipes for Stockfish process.");
+        }
 
         pid_t pid = fork();
         if (pid == 0) {               // child → Stockfish

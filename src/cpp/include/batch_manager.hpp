@@ -43,6 +43,7 @@ private:
     size_t                                   batch_size_{1};
     torch::jit::script::Module               module_;   // TorchScript graph
     torch::Device                            device_{torch::kCPU};
+    c10::ScalarType                          module_dtype_{torch::kFloat32};
     std::thread                              runner_thread_;
 };
 
