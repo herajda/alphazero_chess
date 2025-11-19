@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
                         help="torch.compile mode to use (e.g., 'default', 'reduce-overhead', 'max-autotune').")
     parser.add_argument("--compile-fullgraph", action="store_true",
                         help="Request fullgraph=True when compiling (experimental).")
+    
+    # Model Architecture Arguments
+    parser.add_argument("--model_type", default="transformer", choices=["transformer", "cnn", "resnet"], help="Model architecture type.")
+    parser.add_argument("--num_layers", default=6, type=int, help="Number of layers (transformer/resnet).")
+    parser.add_argument("--num_heads", default=8, type=int, help="Number of heads (transformer).")
+    parser.add_argument("--dim_model", default=512, type=int, help="Model dimension (transformer).")
+    parser.add_argument("--num_filters", default=256, type=int, help="Number of filters (cnn/resnet).")
+
     parser.set_defaults(compile=True)
     return parser.parse_args()
 
