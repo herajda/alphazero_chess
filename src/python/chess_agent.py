@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from multiprocessing import Pool
 from torch.cuda.amp import GradScaler, autocast
 from chess_game import ChessGame  
-from models import TransformerModel, CNNModel, ResNetModel
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -48,11 +47,6 @@ parser.add_argument("--compile-mode", type=str, default="default",
                     help="torch.compile mode to use (e.g., 'default', 'reduce-overhead', 'max-autotune').")
 parser.add_argument("--compile-fullgraph", action="store_true",
                     help="Request fullgraph=True when compiling (experimental).")
-parser.add_argument("--model_type", default="transformer", choices=["transformer", "cnn", "resnet"], help="Model architecture type.")
-parser.add_argument("--num_layers", default=6, type=int, help="Number of layers (transformer/resnet).")
-parser.add_argument("--num_heads", default=8, type=int, help="Number of heads (transformer).")
-parser.add_argument("--dim_model", default=512, type=int, help="Model dimension (transformer).")
-parser.add_argument("--num_filters", default=256, type=int, help="Number of filters (cnn/resnet).")
 parser.set_defaults(compile=False)
 
 class ReplayBuffer:
@@ -114,15 +108,115 @@ class Agent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def __init__(self, args):
-        self.args = args
-        model_cls = {
-            "transformer": TransformerModel,
-            "cnn": CNNModel,
-            "resnet": ResNetModel,
-        }.get(getattr(args, "model_type", "transformer"), TransformerModel)
-        
+
+        class TransformerModel(nn.Module):
+            def __init__(self, args):
+                super(TransformerModel, self).__init__()
+                self.board_size       = ChessGame.N        # 8
+                self.initial_channels = 119
+                self.dim_model        = 512               # ↑ was 512
+                self.num_actions      = ChessGame.ACTIONS  # 4672
+                self.num_layers       = 6                 # ↑ was 6
+                self.num_heads        = 8 # ↑ was 8
+                self.ff_multiplier    = 2
+
+                # --- Input projection ---
+                self.input_proj = nn.Conv2d(
+                    self.initial_channels, self.dim_model, kernel_size=1
+                )
+
+                # --- 2D Positional Encoding ---
+                self.register_buffer("pos_encoding", self.create_positional_encoding())
+
+                # --- Transformer stack ---
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=self.dim_model,
+                    nhead=self.num_heads,
+                    dim_feedforward=self.dim_model * self.ff_multiplier,
+                    dropout=0.1,
+                    batch_first=True
+                )
+                self.transformer = nn.TransformerEncoder(
+                    encoder_layer,
+                    num_layers=self.num_layers
+                )
+
+                self.use_policy_1x1 = True
+                # --- Policy head (keeps legacy conv+dense for backward compatibility) ---
+                self.policy_conv    = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
+                self.policy_1x1 = nn.Conv2d(self.dim_model, 73, kernel_size=1, bias=False)  # [B,73,8,8]
+                self.policy_flatten = nn.Flatten()
+                self.policy_dense   = nn.Linear(2 * self.board_size * self.board_size,
+                                                self.num_actions)
+
+                # --- Value head (same pattern as before) ---
+                self.value_conv     = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
+                self.value_flatten  = nn.Flatten()
+                self.value_dense    = nn.Linear(self.board_size * self.board_size, 1)
+
+            def create_positional_encoding(self):
+                # Build a [8,8,dim_model] grid of 2D sine/cosine, then flatten to [1,64,dim_model]
+                pe = torch.zeros(self.board_size, self.board_size, self.dim_model)
+                pos_row = torch.arange(self.board_size).float().unsqueeze(1)
+                pos_col = torch.arange(self.board_size).float().unsqueeze(1)
+                div_term = torch.exp(
+                    torch.arange(0, self.dim_model, 2).float() *
+                    (-math.log(10000.0) / self.dim_model)
+                )
+
+                pe_row = torch.zeros(self.board_size, self.dim_model)
+                pe_col = torch.zeros(self.board_size, self.dim_model)
+                pe_row[:, 0::2] = torch.sin(pos_row * div_term)
+                pe_row[:, 1::2] = torch.cos(pos_row * div_term)
+                pe_col[:, 0::2] = torch.sin(pos_col * div_term)
+                pe_col[:, 1::2] = torch.cos(pos_col * div_term)
+
+                for i in range(self.board_size):
+                    for j in range(self.board_size):
+                        pe[i, j] = pe_row[i] + pe_col[j]
+
+                # flatten to [64, dim_model], then unsqueeze batch: [1,64,dim_model]
+                pe = pe.view(-1, self.dim_model).unsqueeze(0)
+                return pe
+
+            def forward(self, x):
+                # x: [B, 8,8,119]
+                bsz = x.size(0)
+
+                # --- Input projection ---
+                x = x.permute(0, 3, 1, 2)            # [B, 119,8,8]
+                x = self.input_proj(x)              # [B,1024,8,8]
+
+                # --- Prepare for Transformer ---
+                x = x.flatten(2).transpose(1, 2)     # [B, 64, 1024]
+                x = x + self.pos_encoding            # [B, 64, 1024]
+                x = self.transformer(x)              # [B, 64, 1024]
+
+                # --- Back to grid ---
+                x = x.transpose(1, 2).view(bsz,
+                                           self.dim_model,
+                                           self.board_size,
+                                           self.board_size)  # [B,1024,8,8]
+
+                # --- Policy Head ---
+                if self.use_policy_1x1:
+                    logits_73_8x8 = self.policy_1x1(x)
+                    policy_logits = logits_73_8x8.permute(0, 2, 3, 1).contiguous() # [B,8,8,73]
+                    policy_logits = policy_logits.view(bsz, 64*73) # [B,4672]
+                else:
+                    px = self.policy_conv(x)
+                    px = self.policy_flatten(px)
+                    policy_logits = self.policy_dense(px)
+                # --- Value Head ---
+                vx = self.value_conv(x)              # [B,1,8,8]
+                vx = self.value_flatten(vx)          # [B, 64]
+                value = torch.tanh(self.value_dense(vx))           # [B,1]
+
+                return policy_logits, value
+
+
         self._compiled = False
-        self._model = model_cls(args).to(self.device)
+        self._model = TransformerModel(args).to(self.device)
         self._maybe_compile_model(args)
         requested_precision = getattr(args, "precision", "bf16")
         self.precision = requested_precision.lower()
@@ -168,32 +262,9 @@ class Agent:
         return cleaned
 
     @classmethod
-    def load(cls, path: str, args=None) -> "Agent":
-        checkpoint = torch.load(path, map_location=cls.device)
-        
-        if isinstance(checkpoint, dict) and 'model_args' in checkpoint:
-            # New format with args
-            saved_args_dict = checkpoint['model_args']
-            # If args were passed, we might want to merge or override, but for now let's use saved args
-            # for model construction to ensure architecture matches.
-            # We convert dict back to Namespace
-            saved_args = argparse.Namespace(**saved_args_dict)
-            
-            # If 'args' was passed (e.g. for runtime flags like threads), we can update saved_args with it
-            if args:
-                for k, v in vars(args).items():
-                    if k not in saved_args_dict: # Only add if not present, or maybe override?
-                         setattr(saved_args, k, v)
-            
-            agent = Agent(saved_args)
-            state = checkpoint['state_dict']
-        else:
-            # Legacy format (just state dict)
-            if args is None:
-                raise ValueError("args must be provided when loading legacy checkpoints")
-            agent = Agent(args)
-            state = checkpoint
-            
+    def load(cls, path: str, args) -> "Agent":
+        agent = Agent(args)
+        state = torch.load(path, map_location=agent.device)
         state = cls._strip_compile_prefix(state)
         base_model = cls._unwrap_compiled_model(agent._model)
         if "policy_1x1.weight" not in state:
@@ -211,7 +282,7 @@ class Agent:
 
     def save(self, path: str) -> None:
         state = self._strip_compile_prefix(self._model.state_dict())
-        torch.save({'state_dict': state, 'model_args': vars(self.args)}, path)
+        torch.save(state, path)
 
     def _maybe_compile_model(self, args) -> None:
         self._compiled = False
