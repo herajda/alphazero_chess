@@ -110,7 +110,7 @@ def load_all_records(path: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="AlphaZero training with C++ buffered self-play backend")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
-    parser.add_argument("--threads", type=int, default=90, help="Number of C++ self-play threads (and inference batch).")
+    parser.add_argument("--threads", type=int, default=os.cpu_count() or 1, help="Number of C++ self-play threads (and inference batch).")
     parser.add_argument("--sim_games", type=int, default=100, help="Number of self-play games per iteration.")
     parser.add_argument("--start_num_simulations", type=int, default=100, help="Initial number of MCTS simulations per move.")
     parser.add_argument("--end_num_simulations", type=int, default=600, help="Final number of MCTS simulations per move.")
@@ -131,13 +131,13 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default="model.pt", help="Path to save final model.")
     parser.add_argument("--replay_buffer_capacity", type=int, default=200000, help="Max on-disk entries in ring buffer.")
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
-    parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
+    parser.add_argument("--pretrain", action="store_true", help="Train once on an existing games.bin before self-play.")
     # ───────────────── bootstrap / pure-MCTS pretraining ─────────────────
-    parser.add_argument("--bootstrap_games", type=int, default=1000,
+    parser.add_argument("--bootstrap_games", type=int, default=0,
                         help="If >0 run this many self-play games with a "
                              "uniform dummy network *before* iteration 1.")
     parser.add_argument("--bootstrap_num_simulations", type=int, default=600)
-    parser.add_argument("--bootstrap_threads", type=int, default=90)
+    parser.add_argument("--bootstrap_threads", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--bootstrap_train_for", type=int, default=60,
                         help="SGD steps (on the just generated buffer) "
                              "before entering the regular loop.")
@@ -248,6 +248,11 @@ def main():
     args = parse_args()
     writer = SummaryWriter(log_dir=getattr(args, "log_dir", None))
 
+    effective_threads = min(args.threads, os.cpu_count() or args.threads)
+    if effective_threads != args.threads:
+        print(f"[train_cpp] Clamping threads from {args.threads} to {effective_threads} (available cores).")
+        args.threads = effective_threads
+    args.bootstrap_threads = min(args.bootstrap_threads, os.cpu_count() or args.bootstrap_threads)
 
     # set seeds and threading
     np.random.seed(args.seed)
@@ -260,8 +265,13 @@ def main():
     if args.resume_model:
         agent = Agent.load(args.resume_model, args)
         print(f"Resumed model from {args.resume_model}");
+        if args.model_path != args.resume_model:
+            agent.save(args.model_path)
+            print(f"Saved resumed weights to {args.model_path} for ongoing training.")
     else:
         agent = Agent(args)
+        agent.save(args.model_path)
+        print(f"Saved initial random model to {args.model_path}")
 
     iteration = 0
     training = True

@@ -18,6 +18,16 @@ struct MCTArgs {
     int sampling_moves;
 };
 
+[[nodiscard]] float terminal_value_for_side_to_move(int winner, int to_play);
+[[nodiscard]] std::vector<float> normalise_legal_policy(
+    const std::vector<float>& policy,
+    const std::vector<uint16_t>& legal);
+[[nodiscard]] double puct_score_from_parent(
+    float child_value,
+    float prior,
+    int parent_visit_count,
+    int child_visit_count);
+
 class MCTNode {
 public:
     MCTNode(float prior, const ChessGame& game);

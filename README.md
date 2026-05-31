@@ -30,4 +30,10 @@ to download the library files.
 
 Stockfish is needed for evaluating the agent. Ensure a Stockfish binary is installed and available in your `PATH`.
 
+## Correctness tests
+After installing requirements and building the C++ extension with `scripts/setup.sh`, run:
+
+```bash
+python -m pytest -q
+```
 

@@ -4,8 +4,91 @@
 #include <algorithm>
 #include <numeric>
 #include <iostream>
+#include <limits>
 
 namespace az73 {
+
+float terminal_value_for_side_to_move(int winner, int to_play) {
+    if (winner == -1) {
+        return 0.0f;
+    }
+    return winner == to_play ? 1.0f : -1.0f;
+}
+
+std::vector<float> normalise_legal_policy(const std::vector<float> &policy,
+                                          const std::vector<uint16_t> &legal) {
+    std::vector<float> priors(legal.size(), 0.0f);
+    if (legal.empty()) {
+        return priors;
+    }
+
+    bool looks_like_probs = !policy.empty();
+    double full_sum = 0.0;
+    for (float p : policy) {
+        if (!std::isfinite(p) || p < 0.0f) {
+            looks_like_probs = false;
+            break;
+        }
+        full_sum += p;
+    }
+    looks_like_probs = looks_like_probs && std::abs(full_sum - 1.0) < 1e-3;
+
+    if (looks_like_probs) {
+        double legal_sum = 0.0;
+        for (std::size_t i = 0; i < legal.size(); ++i) {
+            const uint16_t a = legal[i];
+            if (a < policy.size()) {
+                priors[i] = policy[a];
+                legal_sum += priors[i];
+            }
+        }
+        if (legal_sum > 0.0) {
+            for (float &p : priors) {
+                p = static_cast<float>(p / legal_sum);
+            }
+            return priors;
+        }
+    }
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (uint16_t a : legal) {
+        if (a < policy.size() && std::isfinite(policy[a])) {
+            max_logit = std::max(max_logit, policy[a]);
+        }
+    }
+    if (!std::isfinite(max_logit)) {
+        std::fill(priors.begin(), priors.end(), 1.0f / static_cast<float>(legal.size()));
+        return priors;
+    }
+
+    double sum = 0.0;
+    for (std::size_t i = 0; i < legal.size(); ++i) {
+        const uint16_t a = legal[i];
+        if (a < policy.size() && std::isfinite(policy[a])) {
+            priors[i] = std::exp(policy[a] - max_logit);
+            sum += priors[i];
+        }
+    }
+    if (sum <= 0.0 || !std::isfinite(sum)) {
+        std::fill(priors.begin(), priors.end(), 1.0f / static_cast<float>(legal.size()));
+        return priors;
+    }
+    for (float &p : priors) {
+        p = static_cast<float>(p / sum);
+    }
+    return priors;
+}
+
+double puct_score_from_parent(float child_value,
+                              float prior,
+                              int parent_visit_count,
+                              int child_visit_count) {
+    const double parent_visits = std::max(1, parent_visit_count);
+    const double safe_prior = std::isfinite(prior) && prior > 0.0f ? prior : 0.0;
+    const double child_q = std::isfinite(child_value) ? -child_value : 0.0;
+    const double c_puct = std::log((1.0 + parent_visits + 1965.2) / 1965.2) + 1.25;
+    return child_q + c_puct * safe_prior * std::sqrt(parent_visits) / (child_visit_count + 1);
+}
 
 // initialize thread-local RNG
 thread_local std::mt19937_64 MCTNode::rng_{std::random_device{}()};
@@ -21,55 +104,29 @@ bool MCTNode::is_expanded() const {
 }
 
 void MCTNode::expand() {
-    // --- 1) Check for terminal parent, unchanged from yours ---
     if (auto win = game_.winner()) {
         children_.clear();
-        float v = (win.value() == -1 ? 0.0f
-                   : win.value() == game_.to_play() ? -1.0f
-                   : 1.0f);
+        float v = terminal_value_for_side_to_move(win.value(), game_.to_play());
         visit_count_ = 1;
         total_value_ = v;
         return;
     }
 
-    // --- 2) Get net policy + value ---
     auto tensor = game_.encodeTensor();
     std::vector<float> flat(tensor.begin(), tensor.end());
     auto [policy, v] = BatchManager::instance()
                           .enqueue(flat).get();
 
-    //// --- 3) Build children & collect terminals ---
     auto legal = game_.legalMoves();
+    auto priors = sanitise_priors(policy, legal);
 
-    //std::vector<uint16_t> win_moves;
-    //// stash the raw network priors so we can rescale later
-    std::unordered_map<uint16_t, float> orig_prior;
+    std::size_t idx = 0;
     for (auto a : legal) {
         ChessGame next = game_;
         next.makeMove(a);
-
-        // store original
-        orig_prior[a] = policy[a];
-        children_[a] = std::make_unique<MCTNode>(policy[a], next);
-
-        //// detect terminal children
-        //if (auto w = next.winner()) {
-        //    if (w.value() != game_.to_play())
-        //        win_moves.push_back(a);
-        //    // draws (w == -1) are ignored here
-        //}
+        children_[a] = std::make_unique<MCTNode>(priors[idx++], next);
     }
 
-    //// --- 4) Override the priors if we saw any wins or losses ---
-    //if (!win_moves.empty()) {
-    //    // Case A: we have winning moves → uniform over those
-    //    float p = 1.0f / win_moves.size();
-    //    for (auto &kv : children_) kv.second->prior_ = 0.0f;
-    //    for (auto a : win_moves) children_[a]->prior_ = p;
-    //}
-    // else: no wins *and* no losses → leave net priors untouched
-
-    // --- 5) Finish usual expand bookkeeping ---
     visit_count_ = 1;
     total_value_ = v;
 }
@@ -115,17 +172,14 @@ std::pair<uint16_t, MCTNode *> MCTNode::select_child()
     double best = -1e9;
     uint16_t best_a = 0;
     MCTNode *best_n = nullptr;
-    double N = visit_count_;
-    double C = std::log((1 + N + 1965.2) / 1965.2) + 1.25;
     for (auto &kv : children_)
     {
         auto *c = kv.second.get();
-        // double Q = c->value();
-        // double P = c->prior_;
-        double Q = std::isfinite(c->value()) ? c->value() : 0.0;
-        double P = std::isfinite(c->prior_) ? c->prior_ : 0.0;
-        double Nsa = c->visit_count_;
-        double u = Q + C * P * std::sqrt(N) / (Nsa + 1);
+        double u = puct_score_from_parent(
+            c->value(),
+            c->prior_,
+            visit_count_,
+            c->visit_count_);
         if (u > best)
         {
             best = u;
@@ -153,24 +207,7 @@ void MCTNode::update(float v)
 std::vector<float> MCTNode::sanitise_priors(const std::vector<float> &policy,
                                             const std::vector<uint16_t> &legal)
 {
-    std::vector<float> priors;
-    priors.reserve(legal.size());
-
-    for (uint16_t a : legal)
-    {
-        float p = policy[a];
-        if (!std::isfinite(p) || p <= 0.f)
-            p = 1e-8f; // clamp bad or zero probs
-        priors.push_back(p);
-    }
-
-    float sum = std::accumulate(priors.begin(), priors.end(), 0.0f);
-    if (sum <= 0.f)
-        sum = 1.f;
-    for (float &p : priors)
-        p /= sum; // explicit renorm
-
-    return priors;
+    return normalise_legal_policy(policy, legal);
 }
 
 void MCTNode::complete_expand(const std::vector<float> &policy, float v)

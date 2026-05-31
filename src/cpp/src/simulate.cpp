@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <atomic>
 #include <csignal> // <-- add this
+#include <numeric>
 
 namespace az73 {
 
@@ -487,6 +488,53 @@ PYBIND11_MODULE(chess_engine, m) {
           py::arg("sampling_moves"),
           "Evaluate the AlphaZero agent vs a random agent, returning "
           "(white_wins, white_losses, white_draws, black_wins, black_losses, black_draws).");
+    m.def("legal_actions",
+        [](const std::string &fen) {
+            ChessGame game(fen);
+            return game.legalMoves();
+        },
+        py::arg("fen"),
+        "Return legal AlphaZero action ids for a FEN.");
+    m.def("action_to_uci",
+        [](const std::string &fen, uint16_t action) {
+            ChessGame game(fen);
+            return chess::uci::moveToUci(az73::decode_action(action, game.currentBoard()));
+        },
+        py::arg("fen"),
+        py::arg("action"),
+        "Decode an AlphaZero action id to UCI in the given FEN.");
+    m.def("encode_tensor",
+        [](const std::string &fen) {
+            ChessGame game(fen);
+            return game.encodeTensor();
+        },
+        py::arg("fen"),
+        "Return the 8x8x119 encoded tensor flattened in row/file/channel order.");
+    m.def("normalise_legal_policy",
+        &az73::normalise_legal_policy,
+        py::arg("policy"),
+        py::arg("legal"),
+        "Normalise policy/logit output over legal actions.");
+    m.def("terminal_value",
+        [](const std::string &fen) -> py::object {
+            ChessGame game(fen);
+            auto winner = game.winner();
+            if (!winner.has_value()) {
+                return py::none();
+            }
+            return py::float_(az73::terminal_value_for_side_to_move(
+                winner.value(),
+                game.to_play()));
+        },
+        py::arg("fen"),
+        "Return terminal value from the side-to-move perspective, or None.");
+    m.def("puct_score_from_parent",
+        &az73::puct_score_from_parent,
+        py::arg("child_value"),
+        py::arg("prior"),
+        py::arg("parent_visit_count"),
+        py::arg("child_visit_count"),
+        "Return the PUCT score using child value from the child perspective.");
     m.def("select_move",
         // Lambda takes: path to TorchScript, FEN, MCTS params → returns best flat action
         [](const std::string &model_path,

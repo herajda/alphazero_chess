@@ -336,7 +336,7 @@ class MCTNode:
 
     def select_child(self) -> tuple[int, "MCTNode"]:
         def ucb_score(child: "MCTNode"):
-            Q = child.value()
+            Q = -child.value()
             P = child.prior
             N = self.visit_count
             N_sa = child.visit_count
