@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <future>
 #include <memory>
+#include <chrono>
 #include <torch/script.h>
 
 namespace az73 {
@@ -14,6 +15,7 @@ namespace az73 {
 struct EvalRequest {
     std::vector<float> tensor;
     std::promise<std::pair<std::vector<float>, float>> promise;
+    std::chrono::steady_clock::time_point enqueue_time;
 };
 
 class __attribute__((visibility("hidden"))) BatchManager {
@@ -22,7 +24,8 @@ public:
     static BatchManager& instance();
 
     // Initialize with the path to a TorchScript module and batch size
-    void init(const std::string& model_path, size_t batch_size);
+    // wait_ms controls how long we wait to gather a fuller batch.
+    void init(const std::string& model_path, size_t batch_size, int wait_ms = 2);
 
     // Enqueue a flat tensor, return a future for {policy, value}
     std::future<std::pair<std::vector<float>, float>>
@@ -41,6 +44,7 @@ private:
     std::deque<std::shared_ptr<EvalRequest>> queue_;
     bool                                     running_{false};
     size_t                                   batch_size_{1};
+    int                                      flush_wait_ms_{2};
     torch::jit::script::Module               module_;   // TorchScript graph
     torch::Device                            device_{torch::kCPU};
     c10::ScalarType                          module_dtype_{torch::kFloat32};

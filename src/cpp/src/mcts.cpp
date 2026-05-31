@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <numeric>
 #include <iostream>
+#include <chrono>
+#include <cstdlib>
 
 namespace az73 {
 
@@ -20,6 +22,29 @@ bool MCTNode::is_expanded() const {
     return visit_count_ > 0;
 }
 
+namespace {
+bool mcts_debug_enabled() {
+    static const bool enabled = []() {
+        if (const char* env = std::getenv("AZ_MCTS_DEBUG")) {
+            return env[0] != '0';
+        }
+        return false;
+    }();
+    return enabled;
+}
+
+int mcts_wait_log_ms() {
+    static const int threshold = []() {
+        if (const char* env = std::getenv("AZ_MCTS_WAIT_LOG_MS")) {
+            int v = std::atoi(env);
+            return v > 0 ? v : 2000;
+        }
+        return 2000;
+    }();
+    return threshold;
+}
+} // namespace
+
 void MCTNode::expand() {
     // --- 1) Check for terminal parent, unchanged from yours ---
     if (auto win = game_.winner()) {
@@ -35,8 +60,16 @@ void MCTNode::expand() {
     // --- 2) Get net policy + value ---
     auto tensor = game_.encodeTensor();
     std::vector<float> flat(tensor.begin(), tensor.end());
-    auto [policy, v] = BatchManager::instance()
-                          .enqueue(flat).get();
+    auto start_wait = std::chrono::steady_clock::now();
+    auto fut = BatchManager::instance().enqueue(flat);
+    auto [policy, v] = fut.get();
+    if (mcts_debug_enabled()) {
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_wait).count();
+        if (elapsed_ms >= mcts_wait_log_ms()) {
+            std::cerr << "[AZ][perf][mcts] inference wait " << elapsed_ms << " ms\n";
+        }
+    }
 
     //// --- 3) Build children & collect terminals ---
     auto legal = game_.legalMoves();

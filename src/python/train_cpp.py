@@ -7,6 +7,7 @@ with on-disk circular replay buffer.
 """
 import argparse
 import os
+from textwrap import dedent
 os.environ["MKL_THREADING_LAYER"] = "GNU"  
 import struct, random, subprocess, json, threading, math
 
@@ -110,7 +111,18 @@ def load_all_records(path: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="AlphaZero training with C++ buffered self-play backend")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
-    parser.add_argument("--threads", type=int, default=90, help="Number of C++ self-play threads (and inference batch).")
+    parser.add_argument("--threads", type=int, default=os.cpu_count() or 32,
+                        help="Number of C++ self-play threads (and inference batch).")
+    parser.add_argument("--inference_batch_size", type=int, default=None,
+                        help="Batch size for C++ batched inference; defaults to num_threads when unset.")
+    parser.add_argument("--inference_queue_wait_ms", type=int, default=6,
+                        help="Milliseconds to wait before flushing an inference batch.")
+    parser.add_argument("--perf_debug", action="store_true",
+                        help="Enable verbose perf logging for C++ self-play/inference.", default=True)
+    parser.add_argument("--log_step_throughput", action="store_true",
+                        help="Log how many self-play positions/games are generated per second.", default=True)
+    parser.add_argument("--step_log_interval", type=float, default=1.0,
+                        help="Seconds between throughput log lines when enabled.")
     parser.add_argument("--sim_games", type=int, default=100, help="Number of self-play games per iteration.")
     parser.add_argument("--start_num_simulations", type=int, default=100, help="Initial number of MCTS simulations per move.")
     parser.add_argument("--end_num_simulations", type=int, default=600, help="Final number of MCTS simulations per move.")
@@ -119,14 +131,31 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=0.3, help="Dirichlet alpha for root noise.")
     parser.add_argument("--epsilon", type=float, default=0.25, help="Exploration epsilon for root noise.")
     parser.add_argument("--sampling_moves", type=int, default=30, help="Number of moves to sample before switching to greedy.")
-    parser.add_argument("--batch_size", type=int, default=400, help="Training batch size.")
+    parser.add_argument("--batch_size", type=int, default=2048, help="Training batch size.")
     parser.add_argument("--train_for", type=int, default=120, help="Training steps per iteration.")
-    parser.add_argument("--learning_rate", type=float, default=0.0015, help="Initial learning rate.")
+    parser.add_argument("--learning_rate", type=float, default=3.1e-4, help="Initial learning rate (tuned for resnet_288_standard12).")
     parser.add_argument("--final_learning_rate", type=float, default=0.0001, help="Final learning rate after decay.")
-    parser.add_argument("--weight_decay", type=float, default=0.0001, help="AdamW weight decay.")
+    parser.add_argument("--weight_decay", type=float, default=1.1e-4, help="AdamW weight decay.")
     parser.add_argument("--total_decay_iterations", type=int, default=500, help="Iterations over which to linearly decay the learning rate.")
     parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16",
                         help="Computation precision for the agent (fp16/bf16 require compatible CUDA).")
+    parser.add_argument("--model_arch", choices=("transformer", "cnn", "resnet", "convnext"), default="resnet",
+                        help="Backbone architecture for the policy/value network.")
+    parser.add_argument("--transformer_dim", type=int, default=512, help="Transformer embedding dimension.")
+    parser.add_argument("--transformer_heads", type=int, default=8, help="Transformer attention heads.")
+    parser.add_argument("--transformer_layers", type=int, default=6, help="Transformer encoder layers.")
+    parser.add_argument("--transformer_ff_multiplier", type=int, default=2, help="Transformer FFN expansion ratio.")
+    parser.add_argument("--cnn_channels", type=int, default=256, help="CNN base channels.")
+    parser.add_argument("--cnn_depth", type=int, default=8, help="CNN depth (number of conv blocks).")
+    parser.add_argument("--cnn_kernel_size", type=int, default=3, help="CNN intermediate kernel size.")
+    parser.add_argument("--resnet_channels", type=int, default=288, help="ResNet channel width.")
+    parser.add_argument("--resnet_blocks", type=int, default=12, help="Number of residual blocks.")
+    parser.add_argument("--resnet_bottleneck", action="store_true", help="Use bottleneck-style residual blocks.")
+    parser.add_argument("--convnext_dims", nargs="*", type=int, default=None, help="ConvNeXt-V2 dims per stage (len=4).")
+    parser.add_argument("--convnext_depths", nargs="*", type=int, default=None, help="ConvNeXt-V2 depths per stage (len=4).")
+    parser.add_argument("--convnext_drop_path", type=float, default=0.1, help="ConvNeXt-V2 stochastic depth rate.")
+    parser.add_argument("--convnext_ffn_multiplier", type=float, default=2.0, help="ConvNeXt-V2 FFN multiplier.")
+    parser.add_argument("--convnext_layer_scale_init", type=float, default=1e-6, help="ConvNeXt-V2 layer scale init.")
     parser.add_argument("--evaluate_each", type=int, default=5, help="Perform evaluation every N iterations.")
     parser.add_argument("--checkpoint_interval", type=int, default=10, help="Save model checkpoint every N iterations.")
     parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum number of training iterations.")
@@ -135,11 +164,11 @@ def parse_args():
     parser.add_argument("--resume_model", type=str, default=None, help="Optional path to pretrained model to resume training.")
     parser.add_argument("--pretrain", type=bool, default=False, help="Pretrain the model before self-play.")
     # ───────────────── bootstrap / pure-MCTS pretraining ─────────────────
-    parser.add_argument("--bootstrap_games", type=int, default=1000,
+    parser.add_argument("--bootstrap_games", type=int, default=0,
                         help="If >0 run this many self-play games with a "
                              "uniform dummy network *before* iteration 1.")
     parser.add_argument("--bootstrap_num_simulations", type=int, default=600)
-    parser.add_argument("--bootstrap_threads", type=int, default=90)
+    parser.add_argument("--bootstrap_threads", type=int, default=24)
     parser.add_argument("--bootstrap_train_for", type=int, default=60,
                         help="SGD steps (on the just generated buffer) "
                              "before entering the regular loop.")
@@ -246,22 +275,90 @@ def get_scheduled_num_simulations(iteration, args):
     frac = iteration / (args.num_simulations_steps - 1)
     return int(round(args.start_num_simulations + frac * (args.end_num_simulations - args.start_num_simulations)))
 
+
+def build_export_cmd(model_path: str, ts_path: str, args) -> list[str]:
+    """Construct export_torchscript.py CLI so architecture matches the training config."""
+    cmd = [
+        "python3",
+        "export_torchscript.py",
+        model_path,
+        ts_path,
+        "--model_arch",
+        args.model_arch,
+        "--learning_rate",
+        str(args.learning_rate),
+        "--weight_decay",
+        str(args.weight_decay),
+        "--precision",
+        args.precision,
+        "--transformer_dim",
+        str(args.transformer_dim),
+        "--transformer_heads",
+        str(args.transformer_heads),
+        "--transformer_layers",
+        str(args.transformer_layers),
+        "--transformer_ff_multiplier",
+        str(args.transformer_ff_multiplier),
+        "--cnn_channels",
+        str(args.cnn_channels),
+        "--cnn_depth",
+        str(args.cnn_depth),
+        "--cnn_kernel_size",
+        str(args.cnn_kernel_size),
+        "--resnet_channels",
+        str(args.resnet_channels),
+        "--resnet_blocks",
+        str(args.resnet_blocks),
+        "--convnext_drop_path",
+        str(args.convnext_drop_path),
+        "--convnext_ffn_multiplier",
+        str(args.convnext_ffn_multiplier),
+        "--convnext_layer_scale_init",
+        str(args.convnext_layer_scale_init),
+    ]
+    if args.resnet_bottleneck:
+        cmd.append("--resnet_bottleneck")
+    if args.convnext_dims:
+        cmd.extend(["--convnext_dims", *map(str, args.convnext_dims)])
+    if args.convnext_depths:
+        cmd.extend(["--convnext_depths", *map(str, args.convnext_depths)])
+    return cmd
+
 def main():
     args = parse_args()
     writer = SummaryWriter(log_dir=getattr(args, "log_dir", None))
 
+    # Enable optional performance logging in the C++ backend
+    if args.perf_debug:
+        os.environ["AZ_PERF_DEBUG"] = "1"
+    if args.log_step_throughput or args.perf_debug:
+        os.environ["AZ_LOG_STEP_THROUGHPUT"] = "1"
+        interval_ms = max(1, int(args.step_log_interval * 1000))
+        os.environ["AZ_STEP_LOG_INTERVAL_MS"] = str(interval_ms)
+
+    effective_threads = min(args.threads, os.cpu_count() or args.threads)
+    if effective_threads != args.threads:
+        print(f"[train_cpp] Clamping threads from {args.threads} to {effective_threads} (available cores).")
+
+    inference_batch_size = args.inference_batch_size
+    if inference_batch_size is None or inference_batch_size <= 0:
+        inference_batch_size = -1
+    inference_queue_wait_ms = max(1, args.inference_queue_wait_ms)
 
     # set seeds and threading
     np.random.seed(args.seed)
     if args.seed is not None:
         torch.manual_seed(args.seed)
-    torch.set_num_threads(args.threads)
-    torch.set_num_interop_threads(args.threads)
+    torch.set_num_threads(effective_threads)
+    torch.set_num_interop_threads(effective_threads)
 
     # initialize agent (optionally resume)
     if args.resume_model:
         agent = Agent.load(args.resume_model, args)
         print(f"Resumed model from {args.resume_model}");
+        if args.model_path != args.resume_model:
+            agent.save(args.model_path)
+            print(f"Saved resumed weights to {args.model_path} for ongoing training.")
     else:
         agent = Agent(args)
 
@@ -290,7 +387,9 @@ def main():
             epsilon        = args.epsilon,
             sampling_moves = args.sampling_moves,
             filename       = "games.bin",
-            replay_buffer_capacity = args.bootstrap_replay_buffer_capacity
+            replay_buffer_capacity = args.bootstrap_replay_buffer_capacity,
+            inference_batch_size   = inference_batch_size,
+            inference_queue_wait_ms= inference_queue_wait_ms,
         )
         # (c) load ALL records, shuffle once, train epoch-style
         print("[bootstrap] loading all records into memory …")
@@ -326,7 +425,7 @@ def main():
     if args.resume_model:
         print("Evaluating model before training...")
         ts_path = f"model_ts_initial.pt"
-        subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
+        subprocess.run(build_export_cmd(args.model_path, ts_path, args), check=True)
         spawn_async_evaluation(iteration, ts_path, args, writer)
 
     if args.pretrain:
@@ -364,19 +463,21 @@ def main():
 
         # export to TorchScript
         ts_path = f"model_ts_{iteration}.pt"
-        subprocess.run(["python3", "export_torchscript.py", args.model_path, ts_path], check=True)
+        subprocess.run(build_export_cmd(args.model_path, ts_path, args), check=True)
 
         # buffered self-play generation
         chess_engine.simulate_games_buffered(
             ts_path,
             num_games=args.sim_games,
-            num_threads=args.threads,
+            num_threads=effective_threads,
             num_simulations=scheduled_num_simulations,
             alpha=args.alpha,
             epsilon=args.epsilon,
             sampling_moves=args.sampling_moves,
             filename="games.bin",
-            replay_buffer_capacity=args.replay_buffer_capacity
+            replay_buffer_capacity=args.replay_buffer_capacity,
+            inference_batch_size=inference_batch_size,
+            inference_queue_wait_ms=inference_queue_wait_ms,
         )
         print("Generated self-play games into buffer.")
         torch.cuda.empty_cache()
@@ -407,7 +508,7 @@ def main():
         # periodic evaluation placeholder
         if iteration % args.evaluate_each == 0:
             new_ts = f"model_ts_{iteration}_eval.pt"
-            subprocess.run(["python3", "export_torchscript.py", args.model_path, new_ts], check=True)
+            subprocess.run(build_export_cmd(args.model_path, new_ts, args), check=True)
             spawn_async_evaluation(iteration, new_ts, args, writer)
             torch.cuda.empty_cache()
 

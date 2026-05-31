@@ -27,7 +27,9 @@ void simulate_games_buffered(
     double epsilon,
     int sampling_moves,
     const std::string &filename,
-    int64_t replay_buffer_capacity
+    int64_t replay_buffer_capacity,
+    int inference_batch_size = -1,
+    int inference_queue_wait_ms = 6
 );
 // add just below evaluate_vs_random declaration
 std::tuple<int,int,int,int,int,int>

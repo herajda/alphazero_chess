@@ -17,7 +17,9 @@
 #include <memory>
 #include <filesystem>
 #include <atomic>
+#include <chrono>
 #include <csignal> // <-- add this
+#include <cstdlib>
 #include <cctype>
 #include <cstring>
 #include <array>
@@ -41,6 +43,38 @@ void handle_sigint(int) {
 }
 
 namespace {
+
+bool perf_debug_enabled() {
+    static const bool enabled = []() {
+        if (const char* env = std::getenv("AZ_PERF_DEBUG")) {
+            return env[0] != '0';
+        }
+        return false;
+    }();
+    return enabled;
+}
+
+bool step_throughput_enabled() {
+    static const bool enabled = []() {
+        if (const char* env = std::getenv("AZ_LOG_STEP_THROUGHPUT")) {
+            return env[0] != '0';
+        }
+        // fall back to perf debug so one flag enables both
+        return perf_debug_enabled();
+    }();
+    return enabled;
+}
+
+int step_log_interval_ms() {
+    static const int interval = []() {
+        if (const char* env = std::getenv("AZ_STEP_LOG_INTERVAL_MS")) {
+            int v = std::atoi(env);
+            return v > 0 ? v : 1000;
+        }
+        return 1000;
+    }();
+    return interval;
+}
 
 constexpr std::size_t SUP_STATE_FLOATS = 8 * 8 * 119;
 constexpr std::size_t SUP_STATE_BYTES  = SUP_STATE_FLOATS * sizeof(float);
@@ -918,7 +952,7 @@ evaluate_vs_stockfish(
 {
     using namespace chess;
     constexpr std::size_t GPU_BATCH = 256;
-    BatchManager::instance().init(model_path, GPU_BATCH);
+    BatchManager::instance().init(model_path, GPU_BATCH, 6);
 
     std::atomic<int> wW{0}, wL{0}, wD{0}, bW{0}, bL{0}, bD{0};
     std::atomic<int> gidx{0};
@@ -991,7 +1025,7 @@ evaluate_vs_random(
 ) {
     // 1) initialize model (batch size == num_threads)
     constexpr std::size_t GPU_BATCH = 256;
-    BatchManager::instance().init(model_path, GPU_BATCH);
+    BatchManager::instance().init(model_path, GPU_BATCH, 6);
     py::gil_scoped_release no_gil;
 
     // 2) counters
@@ -1101,8 +1135,13 @@ void simulate_games_buffered(
     double epsilon,
     int sampling_moves,
     const std::string &filename,
-    int64_t capacity
+    int64_t capacity,
+    int inference_batch_size,
+    int inference_queue_wait_ms
 ) {
+    // Reset interruption flag for each invocation so previous CTRL+C does not suppress future runs.
+    interrupted.store(false, std::memory_order_relaxed);
+
     // Install signal handler (only once, safe for repeated calls)
     static std::once_flag sig_flag;
     std::call_once(sig_flag, []() {
@@ -1112,7 +1151,23 @@ void simulate_games_buffered(
 
 
     // 1) Load model
-    BatchManager::instance().init(model_path, 64);
+    const int effective_batch =
+        inference_batch_size > 0 ? inference_batch_size : num_threads;
+    if (perf_debug_enabled()) {
+        std::cerr << "[AZ][perf] simulate_games_buffered begin "
+                  << "num_games=" << num_games
+                  << " threads=" << num_threads
+                  << " num_simulations=" << num_simulations
+                  << " batch=" << effective_batch
+                  << " wait_ms=" << inference_queue_wait_ms
+                  << " buffer_capacity=" << capacity
+                  << " file=" << filename
+                  << "\n";
+    }
+    BatchManager::instance().init(
+        model_path,
+        static_cast<size_t>(std::max(1, effective_batch)),
+        inference_queue_wait_ms);
 
     py::gil_scoped_release no_gil;
 
@@ -1136,6 +1191,45 @@ void simulate_games_buffered(
     int64_t head = read_i64(f, 16);
     std::cerr << "[AZ] initial size=" << size << " head=" << head << "\n";
 
+    // perf counters and optional throughput logger
+    std::atomic<uint64_t> step_counter{0};
+    std::atomic<uint64_t> game_counter{0};
+    std::atomic<bool> throughput_running{false};
+    std::thread throughput_logger;
+    if (step_throughput_enabled()) {
+        throughput_running.store(true, std::memory_order_relaxed);
+        const int interval_ms = step_log_interval_ms();
+        throughput_logger = std::thread([&, interval_ms]() {
+            using clock = std::chrono::steady_clock;
+            auto last = clock::now();
+            uint64_t last_steps = 0;
+            uint64_t last_games = 0;
+            std::cerr << "[AZ][perf] throughput logger started\n";
+            while (throughput_running.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+                auto now = clock::now();
+                auto steps = step_counter.load(std::memory_order_relaxed);
+                auto games = game_counter.load(std::memory_order_relaxed);
+                auto delta_steps = steps - last_steps;
+                auto delta_games = games - last_games;
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+                if (elapsed_ms <= 0) elapsed_ms = 1;
+                double steps_per_s = 1000.0 * static_cast<double>(delta_steps) / static_cast<double>(elapsed_ms);
+                double games_per_s = 1000.0 * static_cast<double>(delta_games) / static_cast<double>(elapsed_ms);
+                double avg_steps = delta_games > 0
+                    ? static_cast<double>(delta_steps) / static_cast<double>(delta_games)
+                    : 0.0;
+                std::cerr << "[AZ][perf] " << steps_per_s << " steps/s, "
+                          << games_per_s << " games/s (avg " << avg_steps
+                          << " steps/game over last " << elapsed_ms << " ms; total steps="
+                          << steps << ", games=" << games << ")\n";
+                last = now;
+                last_steps = steps;
+                last_games = games;
+            }
+        });
+    }
+
     std::mutex file_mtx;
     auto append_one = [&](const std::vector<float> &state, const std::vector<float> &policy, float z) {
         std::lock_guard lk(file_mtx);
@@ -1145,16 +1239,16 @@ void simulate_games_buffered(
         f.write(reinterpret_cast<const char*>(state.data()), state.size() * sizeof(float));
         f.write(reinterpret_cast<const char*>(policy.data()), policy.size() * sizeof(float));
         f.write(reinterpret_cast<const char*>(&z), sizeof(z));
-        f.flush();
         head = (head + 1) % capacity;
         if (size < capacity) ++size;
         write_i64(f, 8, size);
         write_i64(f, 16, head);
-        std::cerr << "[AZ] new size=" << size << " new head=" << head << "\n";
+        step_counter.fetch_add(1, std::memory_order_relaxed);
     };
 
     // --- dynamic, perfectly-balanced scheduling --------------------
     std::atomic<int> game_idx{0};
+    std::atomic<int> games_started{0};
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
 
@@ -1172,6 +1266,10 @@ void simulate_games_buffered(
                 int idx = game_idx.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= num_games)
                     break;
+                games_started.fetch_add(1, std::memory_order_relaxed);
+                if (perf_debug_enabled() && idx < 2) {
+                    std::cerr << "[AZ][perf] thread " << t << " starting game " << idx << "\n";
+                }
 
                 // ----- simulate exactly one game -----
                 // (copy the body of 'worker' here, but for a single game)
@@ -1233,13 +1331,26 @@ void simulate_games_buffered(
                                                          : -1.0f);
                     append_one(states[k], policies[k], z);
                 }
+                if (perf_debug_enabled() && states.empty()) {
+                    std::cerr << "[AZ][perf] thread " << t << " finished game " << idx
+                              << " with zero states; winner=" << w << "\n";
+                } else if (perf_debug_enabled() && idx < 2) {
+                    std::cerr << "[AZ][perf] thread " << t << " finished game " << idx
+                              << " steps=" << states.size() << "\n";
+                }
+                game_counter.fetch_add(1, std::memory_order_relaxed);
                 // ----------------------------------------
             }
         });
     }
     for (auto &th : threads) th.join();
     f.close();
-    std::cerr << "[AZ] simulate_games_buffered DONE\n";
+    std::cerr << "[AZ] simulate_games_buffered DONE (started=" << games_started.load() << ")\n";
+
+    if (throughput_logger.joinable()) {
+        throughput_running.store(false, std::memory_order_relaxed);
+        throughput_logger.join();
+    }
 
     // If interrupted, raise Python KeyboardInterrupt
     if (interrupted) {
@@ -1283,7 +1394,9 @@ PYBIND11_MODULE(chess_engine, m) {
         py::arg("epsilon"),
         py::arg("sampling_moves"),
         py::arg("filename"),
-        py::arg("replay_buffer_capacity"));
+        py::arg("replay_buffer_capacity"),
+        py::arg("inference_batch_size") = -1,
+        py::arg("inference_queue_wait_ms") = 6);
     
     m.def("evaluate_vs_random", &az73::evaluate_vs_random,
           py::arg("model_path"),
@@ -1306,7 +1419,7 @@ PYBIND11_MODULE(chess_engine, m) {
         {
             // 1) Initialize the batched model (use a reasonable batch size)
             constexpr size_t BATCH = 1;
-            BatchManager::instance().init(model_path, BATCH);
+            BatchManager::instance().init(model_path, BATCH, 2);
 
             // 2) Build game from FEN
             ChessGame game(fen);
