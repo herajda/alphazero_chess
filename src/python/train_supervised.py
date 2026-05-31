@@ -29,7 +29,7 @@ import chess_engine
 from chess_agent import Agent
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Supervised chess training using PGN data.")
     default_pgn = Path("data") / "lichess_db_standard_rated_2017-09.pgn.zst"
     parser.add_argument("--pgn", type=Path, default=default_pgn,
@@ -79,16 +79,47 @@ def parse_args() -> argparse.Namespace:
                         help="torch.compile mode to use (e.g., 'default', 'reduce-overhead', 'max-autotune').")
     parser.add_argument("--compile-fullgraph", action="store_true",
                         help="Request fullgraph=True when compiling (experimental).")
-    
-    # Model Architecture Arguments
-    parser.add_argument("--model_type", default="transformer", choices=["transformer", "cnn", "resnet"], help="Model architecture type.")
-    parser.add_argument("--num_layers", default=6, type=int, help="Number of layers (transformer/resnet).")
-    parser.add_argument("--num_heads", default=8, type=int, help="Number of heads (transformer).")
-    parser.add_argument("--dim_model", default=512, type=int, help="Model dimension (transformer).")
-    parser.add_argument("--num_filters", default=256, type=int, help="Number of filters (cnn/resnet).")
-
+    parser.add_argument("--model-arch", choices=("transformer", "cnn", "resnet", "convnext"),
+                        default="transformer",
+                        help="Backbone to use for the policy/value network.")
+    parser.add_argument("--transformer-dim", type=int, default=512,
+                        help="Embedding dimension for the transformer backbone.")
+    parser.add_argument("--transformer-heads", type=int, default=8,
+                        help="Number of attention heads for the transformer backbone.")
+    parser.add_argument("--transformer-layers", type=int, default=6,
+                        help="Number of transformer encoder layers.")
+    parser.add_argument("--transformer-ff-multiplier", type=int, default=2,
+                        help="Feed-forward expansion ratio inside transformer blocks.")
+    parser.add_argument("--cnn-channels", type=int, default=256,
+                        help="Base number of channels for the CNN backbone.")
+    parser.add_argument("--cnn-depth", type=int, default=8,
+                        help="Number of convolutional layers for the CNN backbone.")
+    parser.add_argument("--cnn-kernel-size", type=int, default=3,
+                        help="Kernel size for intermediate convolutions in the CNN backbone.")
+    parser.add_argument("--resnet-channels", type=int, default=256,
+                        help="Channel width for the ResNet backbone.")
+    parser.add_argument("--resnet-blocks", type=int, default=6,
+                        help="Number of residual blocks for the ResNet backbone.")
+    parser.add_argument("--resnet-bottleneck", action="store_true",
+                        help="Use bottleneck-style residual blocks for the ResNet backbone.")
+    parser.add_argument("--convnext-dims", nargs="*", type=int, default=None,
+                        help="Channel dimensions per stage for the ConvNeXt-V2 backbone (expects 4 values).")
+    parser.add_argument("--convnext-depths", nargs="*", type=int, default=None,
+                        help="Block counts per stage for the ConvNeXt-V2 backbone (expects 4 values).")
+    parser.add_argument("--convnext-drop-path", type=float, default=0.1,
+                        help="Stochastic depth rate for ConvNeXt-V2 blocks.")
+    parser.add_argument("--convnext-ffn-multiplier", type=float, default=2.0,
+                        help="Feed-forward expansion multiplier for ConvNeXt-V2 blocks.")
+    parser.add_argument("--convnext-layer-scale-init", type=float, default=1e-6,
+                        help="Initial layer scale gamma value for ConvNeXt-V2 blocks.")
+    parser.add_argument("--early-stopping-patience", type=int, default=4,
+                        help="Number of epochs with no meaningful loss improvement before stopping (0 disables).")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=5e-4,
+                        help="Minimum loss improvement between epochs to reset patience.")
+    parser.add_argument("--early-stopping-min-epochs", type=int, default=3,
+                        help="Minimum number of epochs to run before early stopping can trigger.")
     parser.set_defaults(compile=True)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def setup_logging() -> None:
@@ -262,8 +293,18 @@ def train_supervised(args: argparse.Namespace) -> None:
     use_scaler = scaler is not None and scaler.is_enabled()
     autocast_enabled = agent.autocast_dtype is not None
     global_step = 0
+    early_patience = max(0, int(getattr(args, "early_stopping_patience", 0)))
+    early_min_delta = max(0.0, float(getattr(args, "early_stopping_min_delta", 0.0)))
+    early_min_epochs = max(0, int(getattr(args, "early_stopping_min_epochs", 0)))
+    best_epoch_loss = float("inf")
+    best_epoch = 0
+    epochs_since_improve = 0
+    stop_training = False
+    progress_callback = getattr(args, "_progress_callback", None)
     try:
         for epoch in range(1, args.epochs + 1):
+            if stop_training:
+                break
             agent._model.train()
 
             running_loss = running_policy = running_value  = 0.0
@@ -271,6 +312,12 @@ def train_supervised(args: argparse.Namespace) -> None:
             running_time = 0.0
             running_fetch = 0.0
             running_compute = 0.0
+            epoch_loss_sum = 0.0
+            epoch_policy_sum = 0.0
+            epoch_value_sum = 0.0
+            epoch_steps = 0
+            epoch_actions = 0
+            epoch_start_time = time.perf_counter()
 
             for step in range(1, steps_per_epoch + 1):
                 step_start = time.perf_counter()
@@ -307,6 +354,11 @@ def train_supervised(args: argparse.Namespace) -> None:
                 running_fetch += fetch_duration
                 running_compute += compute_duration
                 global_step += 1
+                epoch_loss_sum += float(loss)
+                epoch_policy_sum += float(policy_loss)
+                epoch_value_sum += float(value_loss)
+                epoch_steps += 1
+                epoch_actions += actions.numel()
 
                 if step % args.log_interval == 0:
                     scale = 1.0 / args.log_interval
@@ -327,14 +379,111 @@ def train_supervised(args: argparse.Namespace) -> None:
                         writer.add_scalar("train/actions_per_second", actions_per_sec, global_step)
                         writer.add_scalar("train/fetch_time_sec", avg_fetch, global_step)
                         writer.add_scalar("train/compute_time_sec", avg_compute, global_step)
+                    if callable(progress_callback):
+                        try:
+                            progress_callback({
+                                "scope": "interval",
+                                "epoch": epoch,
+                                "step": step,
+                                "steps_per_epoch": steps_per_epoch,
+                                "global_step": global_step,
+                                "avg_loss": log_loss,
+                                "avg_policy_loss": log_policy,
+                                "avg_value_loss": log_value,
+                                "actions_per_sec": actions_per_sec,
+                                "duration_sec": avg_compute,
+                            })
+                        except Exception as exc:  # noqa: PERF203
+                            logging.warning("Progress callback failed at step %d (epoch %d): %s", step, epoch, exc)
                     running_loss = running_policy = running_value = 0.0
                     running_actions = 0
                     running_time = 0.0
                     running_fetch = 0.0
                     running_compute = 0.0
 
-            agent.save(str(args.model_path))
-            logging.info("Epoch %d complete. Model saved to %s", epoch, args.model_path)
+            if epoch_steps == 0:
+                logging.warning("Epoch %d completed with zero training steps; stopping.", epoch)
+                break
+
+            epoch_duration = time.perf_counter() - epoch_start_time
+            epoch_loss_avg = epoch_loss_sum / epoch_steps
+            epoch_policy_avg = epoch_policy_sum / epoch_steps
+            epoch_value_avg = epoch_value_sum / epoch_steps
+            actions_per_sec_epoch = epoch_actions / epoch_duration if epoch_duration > 0 else 0.0
+
+            logging.info(
+                "Epoch %d summary | loss=%.4f | policy=%.4f | value=%.4f | steps=%d | actions/s=%.1f",
+                epoch,
+                epoch_loss_avg,
+                epoch_policy_avg,
+                epoch_value_avg,
+                epoch_steps,
+                actions_per_sec_epoch,
+            )
+            if writer:
+                writer.add_scalar("epoch/loss", epoch_loss_avg, epoch)
+                writer.add_scalar("epoch/policy_loss", epoch_policy_avg, epoch)
+                writer.add_scalar("epoch/value_loss", epoch_value_avg, epoch)
+                writer.add_scalar("epoch/actions_per_second", actions_per_sec_epoch, epoch)
+                writer.add_scalar("epoch/duration_sec", epoch_duration, epoch)
+
+            if callable(progress_callback):
+                try:
+                    progress_callback({
+                        "scope": "epoch",
+                        "epoch": epoch,
+                        "avg_loss": epoch_loss_avg,
+                        "avg_policy_loss": epoch_policy_avg,
+                        "avg_value_loss": epoch_value_avg,
+                        "actions_per_sec": actions_per_sec_epoch,
+                        "steps": epoch_steps,
+                        "duration_sec": epoch_duration,
+                    })
+                except Exception as exc:  # noqa: PERF203
+                    logging.warning("Progress callback failed at epoch %d: %s", epoch, exc)
+
+            loss_improved = False
+            if epoch_loss_avg + early_min_delta < best_epoch_loss:
+                best_epoch_loss = epoch_loss_avg
+                best_epoch = epoch
+                epochs_since_improve = 0
+                agent.save(str(args.model_path))
+                loss_improved = True
+                logging.info("New best loss %.4f at epoch %d. Checkpoint saved to %s",
+                             best_epoch_loss, epoch, args.model_path)
+            else:
+                epochs_since_improve += 1
+                if early_patience > 0:
+                    logging.info(
+                        "Epoch %d did not beat best loss %.4f (Δ=%.4f). Patience %d/%d",
+                        epoch,
+                        best_epoch_loss,
+                        best_epoch_loss - epoch_loss_avg,
+                        epochs_since_improve,
+                        early_patience,
+                    )
+                else:
+                    logging.info(
+                        "Epoch %d did not beat best loss %.4f (Δ=%.4f). Early stopping disabled.",
+                        epoch,
+                        best_epoch_loss,
+                        best_epoch_loss - epoch_loss_avg,
+                    )
+
+            if (
+                early_patience > 0
+                and epoch >= early_min_epochs
+                and not loss_improved
+                and epochs_since_improve >= early_patience
+            ):
+                logging.info(
+                    "Early stopping triggered at epoch %d. Best loss %.4f observed at epoch %d.",
+                    epoch,
+                    best_epoch_loss,
+                    best_epoch,
+                )
+                stop_training = True
+                break
     finally:
         prefetcher.shutdown()
         if writer:

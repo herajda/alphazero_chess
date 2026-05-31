@@ -54,6 +54,39 @@ parser.add_argument("--num_heads", default=8, type=int, help="Number of heads (t
 parser.add_argument("--dim_model", default=512, type=int, help="Model dimension (transformer).")
 parser.add_argument("--num_filters", default=256, type=int, help="Number of filters (cnn/resnet).")
 parser.set_defaults(compile=False)
+parser.add_argument("--model_arch", choices=("transformer", "cnn", "resnet", "convnext"),
+                    default="transformer",
+                    help="Backbone type for the policy/value network.")
+parser.add_argument("--transformer_dim", type=int, default=512,
+                    help="Embedding dimension for the transformer backbone.")
+parser.add_argument("--transformer_heads", type=int, default=8,
+                    help="Number of attention heads for the transformer backbone.")
+parser.add_argument("--transformer_layers", type=int, default=6,
+                    help="Number of transformer encoder layers.")
+parser.add_argument("--transformer_ff_multiplier", type=int, default=2,
+                    help="Feed-forward expansion ratio inside the transformer.")
+parser.add_argument("--cnn_channels", type=int, default=256,
+                    help="Base channel count for the CNN backbone.")
+parser.add_argument("--cnn_depth", type=int, default=8,
+                    help="Number of convolutional blocks for the CNN backbone.")
+parser.add_argument("--cnn_kernel_size", type=int, default=3,
+                    help="Kernel size for intermediate convolutions in the CNN backbone.")
+parser.add_argument("--resnet_channels", type=int, default=256,
+                    help="Channel width for the ResNet backbone.")
+parser.add_argument("--resnet_blocks", type=int, default=6,
+                    help="Number of residual blocks for the ResNet backbone.")
+parser.add_argument("--resnet_bottleneck", action="store_true",
+                    help="Use bottleneck residual blocks inside the ResNet backbone.")
+parser.add_argument("--convnext_dims", nargs="*", type=int, default=None,
+                    help="Channel dimensions per stage for the ConvNeXt-V2 backbone (expects 4 values).")
+parser.add_argument("--convnext_depths", nargs="*", type=int, default=None,
+                    help="Block counts per stage for the ConvNeXt-V2 backbone (expects 4 values).")
+parser.add_argument("--convnext_drop_path", type=float, default=0.1,
+                    help="Stochastic depth rate for ConvNeXt-V2 blocks.")
+parser.add_argument("--convnext_ffn_multiplier", type=float, default=2.0,
+                    help="Feed-forward expansion multiplier for ConvNeXt-V2 blocks.")
+parser.add_argument("--convnext_layer_scale_init", type=float, default=1e-6,
+                    help="Initial layer scale gamma value for ConvNeXt-V2 blocks.")
 
 class ReplayBuffer:
     """Simple replay buffer with possibly limited capacity."""
@@ -110,19 +143,392 @@ def init_worker():
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+
+class TransformerPolicyValueNet(nn.Module):
+    """Transformer-based policy/value head with configurable width/depth."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.board_size = ChessGame.N
+        self.initial_channels = 119
+        self.num_actions = ChessGame.ACTIONS
+        self.dim_model = getattr(args, "transformer_dim", 512)
+        self.num_layers = getattr(args, "transformer_layers", 6)
+        self.num_heads = getattr(args, "transformer_heads", 8)
+        self.ff_multiplier = getattr(args, "transformer_ff_multiplier", 2)
+
+        self.input_proj = nn.Conv2d(self.initial_channels, self.dim_model, kernel_size=1)
+        self.register_buffer("pos_encoding", self.create_positional_encoding())
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.dim_model,
+            nhead=self.num_heads,
+            dim_feedforward=self.dim_model * self.ff_multiplier,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
+
+        self.use_policy_1x1 = True
+        self.policy_conv = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
+        self.policy_1x1 = nn.Conv2d(self.dim_model, 73, kernel_size=1, bias=False)
+        self.policy_flatten = nn.Flatten()
+        self.policy_dense = nn.Linear(2 * self.board_size * self.board_size, self.num_actions)
+
+        self.value_conv = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
+        self.value_flatten = nn.Flatten()
+        self.value_dense = nn.Linear(self.board_size * self.board_size, 1)
+
+    def create_positional_encoding(self):
+        pe = torch.zeros(self.board_size, self.board_size, self.dim_model)
+        pos_row = torch.arange(self.board_size).float().unsqueeze(1)
+        pos_col = torch.arange(self.board_size).float().unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.dim_model, 2).float() * (-math.log(10000.0) / self.dim_model)
+        )
+        pe_row = torch.zeros(self.board_size, self.dim_model)
+        pe_col = torch.zeros(self.board_size, self.dim_model)
+        pe_row[:, 0::2] = torch.sin(pos_row * div_term)
+        pe_row[:, 1::2] = torch.cos(pos_row * div_term)
+        pe_col[:, 0::2] = torch.sin(pos_col * div_term)
+        pe_col[:, 1::2] = torch.cos(pos_col * div_term)
+        for i in range(self.board_size):
+            for j in range(self.board_size):
+                pe[i, j] = pe_row[i] + pe_col[j]
+        pe = pe.view(-1, self.dim_model).unsqueeze(0)
+        return pe
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz = x.size(0)
+        x = x.permute(0, 3, 1, 2)
+        x = self.input_proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.pos_encoding
+        x = self.transformer(x)
+        x = x.transpose(1, 2).view(
+            bsz, self.dim_model, self.board_size, self.board_size
+        )
+        if self.use_policy_1x1:
+            logits_73_8x8 = self.policy_1x1(x)
+            policy_logits = logits_73_8x8.permute(0, 2, 3, 1).contiguous()
+            policy_logits = policy_logits.view(bsz, 64 * 73)
+        else:
+            px = self.policy_conv(x)
+            px = self.policy_flatten(px)
+            policy_logits = self.policy_dense(px)
+        vx = self.value_conv(x)
+        vx = self.value_flatten(vx)
+        value = torch.tanh(self.value_dense(vx))
+        return policy_logits, value
+
+
+class ConvPolicyValueNet(nn.Module):
+    """Pure CNN baseline with configurable depth."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.board_size = ChessGame.N
+        self.initial_channels = 119
+        self.num_actions = ChessGame.ACTIONS
+        width = getattr(args, "cnn_channels", 256)
+        depth = max(2, int(getattr(args, "cnn_depth", 8)))
+        kernel = max(1, int(getattr(args, "cnn_kernel_size", 3)))
+        padding = kernel // 2
+
+        layers = [
+            nn.Conv2d(self.initial_channels, width, kernel_size=3, padding=1),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+        ]
+        for _ in range(depth - 1):
+            layers.extend(
+                [
+                    nn.Conv2d(width, width, kernel_size=kernel, padding=padding),
+                    nn.BatchNorm2d(width),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+        self.body = nn.Sequential(*layers)
+
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(width, 2, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(2 * self.board_size * self.board_size, self.num_actions),
+        )
+
+        value_hidden = max(width // 2, 64)
+        self.value_head = nn.Sequential(
+            nn.Conv2d(width, 1, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(self.board_size * self.board_size, value_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(value_hidden, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = x.permute(0, 3, 1, 2)
+        features = self.body(x)
+        policy_logits = self.policy_head(features)
+        value = self.value_head(features)
+        return policy_logits, value
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels: int, bottleneck: bool):
+        super().__init__()
+        self.bottleneck = bottleneck
+        if bottleneck:
+            inner = max(channels // 2, 64)
+            self.block = nn.Sequential(
+                nn.Conv2d(channels, inner, kernel_size=1, bias=False),
+                nn.BatchNorm2d(inner),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(inner, inner, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(inner),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(inner, channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(channels),
+            )
+        else:
+            self.block = nn.Sequential(
+                nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.block(x)
+        out += x
+        return F.relu(out, inplace=True)
+
+
+class ResNetPolicyValueNet(nn.Module):
+    """Residual CNN similar to AlphaZero baseline."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.board_size = ChessGame.N
+        self.initial_channels = 119
+        self.num_actions = ChessGame.ACTIONS
+        channels = getattr(args, "resnet_channels", 256)
+        blocks = max(2, int(getattr(args, "resnet_blocks", 6)))
+        bottleneck = bool(getattr(args, "resnet_bottleneck", False))
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(self.initial_channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.res_layers = nn.Sequential(
+            *[ResidualBlock(channels, bottleneck) for _ in range(blocks)]
+        )
+
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(channels, 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(2),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(2 * self.board_size * self.board_size, self.num_actions),
+        )
+
+        self.value_head = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(self.board_size * self.board_size, channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = x.permute(0, 3, 1, 2)
+        features = self.stem(x)
+        features = self.res_layers(features)
+        policy_logits = self.policy_head(features)
+        value = self.value_head(features)
+        return policy_logits, value
+
+
+class LayerNormChannels(nn.Module):
+    """LayerNorm applied over channel dimension while preserving BCHW layout."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+
+class DropPath(nn.Module):
+    """Stochastic depth regularization, following timm's DropPath."""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+class ConvNeXtV2Block(nn.Module):
+    """ConvNeXt-V2 block with depthwise conv and gated MLP."""
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_mult: float = 2.0,
+        drop_path: float = 0.0,
+        layer_scale_init: float = 1e-6,
+    ):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = LayerNormChannels(dim)
+        hidden_dim = int(dim * ffn_mult)
+        self.pwconv1 = nn.Linear(dim, hidden_dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(hidden_dim, dim)
+        self.gamma = (
+            nn.Parameter(layer_scale_init * torch.ones(dim))
+            if layer_scale_init > 0
+            else None
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.permute(0, 3, 1, 2)
+        x = shortcut + self.drop_path(x)
+        return x
+
+
+class ConvNeXtV2PolicyValueNet(nn.Module):
+    """ConvNeXt-V2 inspired backbone tailored for the 8x8 chess board."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.board_size = ChessGame.N
+        self.initial_channels = 119
+        self.num_actions = ChessGame.ACTIONS
+
+        dims = getattr(args, "convnext_dims", None) or [96, 192, 384, 576]
+        depths = getattr(args, "convnext_depths", None) or [2, 2, 6, 2]
+        if len(dims) != 4 or len(depths) != 4:
+            raise ValueError("convnext_dims and convnext_depths must have length 4.")
+        drop_path = float(getattr(args, "convnext_drop_path", 0.1))
+        ffn_mult = float(getattr(args, "convnext_ffn_multiplier", 2.0))
+        layer_scale_init = float(getattr(args, "convnext_layer_scale_init", 1e-6))
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(self.initial_channels, dims[0], kernel_size=3, padding=1),
+            LayerNormChannels(dims[0]),
+        )
+
+        self.stages = nn.ModuleList()
+        self.transitions = nn.ModuleList()
+
+        dpr = torch.linspace(0, drop_path, sum(depths)).tolist()
+        dpr_idx = 0
+        for stage_idx, (dim, depth) in enumerate(zip(dims, depths)):
+            blocks = []
+            for _ in range(depth):
+                blocks.append(
+                    ConvNeXtV2Block(
+                        dim=dim,
+                        ffn_mult=ffn_mult,
+                        drop_path=dpr[dpr_idx],
+                        layer_scale_init=layer_scale_init,
+                    )
+                )
+                dpr_idx += 1
+            self.stages.append(nn.Sequential(*blocks))
+            if stage_idx < len(dims) - 1:
+                self.transitions.append(
+                    nn.Sequential(
+                        LayerNormChannels(dim),
+                        nn.Conv2d(dim, dims[stage_idx + 1], kernel_size=1),
+                    )
+                )
+
+        self.head_norm = LayerNormChannels(dims[-1])
+
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(dims[-1], 2, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(2 * self.board_size * self.board_size, self.num_actions),
+        )
+
+        value_hidden = max(dims[-1] // 2, 128)
+        self.value_head = nn.Sequential(
+            nn.Conv2d(dims[-1], 1, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(self.board_size * self.board_size, value_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(value_hidden, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = x.permute(0, 3, 1, 2)
+        x = self.stem(x)
+        for stage, transition in zip(self.stages, list(self.transitions) + [None]):
+            x = stage(x)
+            if transition is not None:
+                x = transition(x)
+        x = self.head_norm(x)
+        policy_logits = self.policy_head(x)
+        value = self.value_head(x)
+        return policy_logits, value
+
+
+def build_model_from_args(args) -> nn.Module:
+    arch = getattr(args, "model_arch", "transformer")
+    if arch is None:
+        arch = "transformer"
+    arch = str(arch).lower()
+    if arch == "cnn":
+        return ConvPolicyValueNet(args)
+    if arch == "resnet":
+        return ResNetPolicyValueNet(args)
+    if arch in ("convnext", "convnext_v2", "convnextv2"):
+        return ConvNeXtV2PolicyValueNet(args)
+    return TransformerPolicyValueNet(args)
+
 class Agent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def __init__(self, args):
         self.args = args
-        model_cls = {
-            "transformer": TransformerModel,
-            "cnn": CNNModel,
-            "resnet": ResNetModel,
-        }.get(getattr(args, "model_type", "transformer"), TransformerModel)
-        
+        self.architecture = getattr(args, "model_arch", "transformer")
         self._compiled = False
-        self._model = model_cls(args).to(self.device)
+        self._model = build_model_from_args(args).to(self.device)
         self._maybe_compile_model(args)
         requested_precision = getattr(args, "precision", "bf16")
         self.precision = requested_precision.lower()
@@ -196,7 +602,7 @@ class Agent:
             
         state = cls._strip_compile_prefix(state)
         base_model = cls._unwrap_compiled_model(agent._model)
-        if "policy_1x1.weight" not in state:
+        if hasattr(base_model, "policy_1x1") and "policy_1x1.weight" not in state:
             logging.warning(
                 "Checkpoint does not contain policy_1x1 weights; enabling legacy policy head."
             )
@@ -205,7 +611,13 @@ class Agent:
             state = collections.OrderedDict(state)
             state["policy_1x1.weight"] = default_state["policy_1x1.weight"].detach().clone()
             base_model.use_policy_1x1 = False
-        agent._model.load_state_dict(state)
+        try:
+            base_model.load_state_dict(state)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to load checkpoint. Ensure the saved weights match the requested architecture "
+                f"('{getattr(args, 'model_arch', 'transformer')}')."
+            ) from exc
         agent._model = agent._model.to(agent.device)
         return agent
 
@@ -216,6 +628,11 @@ class Agent:
     def _maybe_compile_model(self, args) -> None:
         self._compiled = False
         if not bool(getattr(args, "compile", False)):
+            return
+        # TorchInductor occasionally throws decoding errors with some ConvNeXt configs;
+        # prefer eager for convnext unless caller explicitly forces compile.
+        if getattr(args, "model_arch", "").lower() == "convnext":
+            logging.info("Skipping torch.compile for ConvNeXt backbone (known TorchInductor instability).")
             return
         if not hasattr(torch, "compile"):
             logging.warning("torch.compile requested but this PyTorch build does not provide torch.compile; skipping.")
