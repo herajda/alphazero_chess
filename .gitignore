@@ -202,3 +202,34 @@ build-debug/
 !lib/
 !lib/chess-library/
 
+# Project build outputs
+/build*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+detect_cuda_version.cc
+
+# AlphaZero training artifacts and large datasets
+/runs/
+/tensorboard/
+/data/
+/src/python/data/
+*.bin
+*.pgn
+*.pgn.zst
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+# Native build products
+*.o
+*.so
+*.pyd
+
+# Keep vendored chess library visible if present
+!/lib/
+!/lib/chess-library/
