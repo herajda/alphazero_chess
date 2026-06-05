@@ -1,5 +1,7 @@
 # scripts/eval_pure_mcts.py
 import argparse
+import os
+import torch
 import chess_engine
 
 def main():

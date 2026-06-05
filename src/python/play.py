@@ -4,7 +4,9 @@ Interactive script to play against your AlphaZero model via the C++ backend.
 """
 
 import argparse
+import os
 import chess
+import torch
 import chess_engine
 import chess_moves
 

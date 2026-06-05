@@ -1,4 +1,7 @@
-import chess, numpy as np, chess_engine, chess_moves
+import os
+import torch
+import chess, numpy as np, chess_moves
+import chess_engine
 
 
 board = chess.Board()

@@ -7,7 +7,9 @@ return a one-line JSON report on stdout.
 Designed to be launched from the training script via subprocess.
 """
 from __future__ import annotations
-import argparse, json, random, sys, pathlib, chess, chess_engine, chess_moves
+import os
+import argparse, json, random, sys, pathlib, torch, chess, chess_moves
+import chess_engine
 import chess.engine as uci
 
 
@@ -69,20 +71,24 @@ def main():
     p.add_argument("--sf-depth",   type=int,   default=12)
     p.add_argument("--sf-elo",     type=int,   default=1320)
     p.add_argument("--threads",     type=int,   default=8)
+    p.add_argument("--skip-stockfish", action="store_true",
+                   help="Only run the random baseline and return stockfish=null.")
     args = p.parse_args()
 
     rnd = eval_vs_random(args.model_ts, args.games, args.sims,
                          args.alpha, args.epsilon, args.sampling, args.threads)
 
-    sf = evaluate_vs_stockfish(
-        args.model_ts,           # TorchScript
-        args.sf_bin,
-        args.games,        # games / colour
-        args.threads,      # new CLI option you can add
-        args.sf_depth,
-        args.sf_elo,
-        args.sims,         # our sims / move
-        args.alpha, args.epsilon, args.sampling)
+    sf = None
+    if not args.skip_stockfish:
+        sf = evaluate_vs_stockfish(
+            args.model_ts,           # TorchScript
+            args.sf_bin,
+            args.games,        # games / colour
+            args.threads,
+            args.sf_depth,
+            args.sf_elo,
+            args.sims,         # our sims / move
+            args.alpha, args.epsilon, args.sampling)
     # single-line JSON makes parsing trivial
     print(json.dumps({"random": rnd, "stockfish": sf}), flush=True)
 

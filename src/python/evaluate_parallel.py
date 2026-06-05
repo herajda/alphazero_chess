@@ -31,6 +31,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Tuple
 
+import torch
 import chess
 import chess.engine as uci
 import chess_moves  # local helper for <action> → UCI

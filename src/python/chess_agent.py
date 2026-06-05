@@ -33,6 +33,13 @@ parser.add_argument("--final_learning_rate", default=0.0001, type=float, help="F
 parser.add_argument("--weight_decay", default=0.001, type=float, help="Weight decay for AdamW.")
 parser.add_argument("--total_decay_iterations", default=100, type=int, help="Total iterations over which the learning rate will decay linearly.")
 parser.add_argument("--infer", default=False, type=bool, help="Inference mode ON or OFF.")
+parser.add_argument("--network", default="resnet", choices=["resnet", "transformer"], help="Neural network architecture.")
+parser.add_argument("--residual_channels", default=192, type=int, help="Channels in the ResNet trunk.")
+parser.add_argument("--residual_blocks", default=12, type=int, help="Residual blocks in the ResNet trunk.")
+parser.add_argument("--transformer_dim_model", default=512, type=int, help="Transformer model width.")
+parser.add_argument("--transformer_layers", default=6, type=int, help="Transformer encoder layers.")
+parser.add_argument("--transformer_heads", default=8, type=int, help="Transformer attention heads.")
+parser.add_argument("--transformer_ff_multiplier", default=2, type=int, help="Transformer feed-forward width multiplier.")
 
 class ReplayBuffer:
     """Simple replay buffer with possibly limited capacity."""
@@ -89,152 +96,281 @@ def init_worker():
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+def _arg(args, name, default):
+    if not hasattr(args, name):
+        setattr(args, name, default)
+    return getattr(args, name)
+
+
+def ensure_model_args(args):
+    _arg(args, "network", "resnet")
+    _arg(args, "residual_channels", 192)
+    _arg(args, "residual_blocks", 12)
+    _arg(args, "transformer_dim_model", 512)
+    _arg(args, "transformer_layers", 6)
+    _arg(args, "transformer_heads", 8)
+    _arg(args, "transformer_ff_multiplier", 2)
+    _arg(args, "learning_rate", 0.001)
+    _arg(args, "weight_decay", 0.001)
+    return args
+
+
+def model_config_from_args(args) -> dict:
+    ensure_model_args(args)
+    return {
+        "network": args.network,
+        "residual_channels": int(args.residual_channels),
+        "residual_blocks": int(args.residual_blocks),
+        "transformer_dim_model": int(args.transformer_dim_model),
+        "transformer_layers": int(args.transformer_layers),
+        "transformer_heads": int(args.transformer_heads),
+        "transformer_ff_multiplier": int(args.transformer_ff_multiplier),
+    }
+
+
+def apply_model_config(args, config: dict):
+    for key, value in config.items():
+        setattr(args, key, value)
+    ensure_model_args(args)
+
+
+def infer_network_from_state_dict(state_dict: dict) -> str:
+    keys = state_dict.keys()
+    if any(k.startswith("stem.") or k.startswith("blocks.") for k in keys):
+        return "resnet"
+    return "transformer"
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        return F.relu(x + residual)
+
+
+class ResNetModel(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        channels = int(args.residual_channels)
+        blocks = int(args.residual_blocks)
+        self.board_size = ChessGame.N
+        self.num_actions = ChessGame.ACTIONS
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(119, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(blocks)])
+
+        # Action ids are file * 8 * 73 + rank * 73 + move_type.
+        self.policy_conv = nn.Conv2d(channels, 73, kernel_size=1)
+
+        self.value_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
+        self.value_bn = nn.BatchNorm2d(1)
+        self.value_fc1 = nn.Linear(self.board_size * self.board_size, 256)
+        self.value_fc2 = nn.Linear(256, 1)
+
+    def forward(self, x):
+        # x: [B, 8, 8, 119]
+        x = x.permute(0, 3, 1, 2)
+        x = self.blocks(self.stem(x))
+
+        policy = self.policy_conv(x)
+        policy_logits = policy.permute(0, 3, 2, 1).contiguous().view(x.size(0), self.num_actions)
+
+        value = F.relu(self.value_bn(self.value_conv(x)))
+        value = value.flatten(1)
+        value = F.relu(self.value_fc1(value))
+        value = torch.tanh(self.value_fc2(value))
+        return policy_logits, value
+
+
+class TransformerModel(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.board_size = ChessGame.N
+        self.initial_channels = 119
+        self.dim_model = int(args.transformer_dim_model)
+        self.num_actions = ChessGame.ACTIONS
+        self.num_layers = int(args.transformer_layers)
+        self.num_heads = int(args.transformer_heads)
+        self.ff_multiplier = int(args.transformer_ff_multiplier)
+
+        self.input_proj = nn.Conv2d(self.initial_channels, self.dim_model, kernel_size=1)
+        self.register_buffer("pos_encoding", self.create_positional_encoding())
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.dim_model,
+            nhead=self.num_heads,
+            dim_feedforward=self.dim_model * self.ff_multiplier,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
+
+        self.policy_conv = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
+        self.policy_flatten = nn.Flatten()
+        self.policy_dense = nn.Linear(2 * self.board_size * self.board_size, self.num_actions)
+
+        self.value_conv = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
+        self.value_flatten = nn.Flatten()
+        self.value_dense = nn.Linear(self.board_size * self.board_size, 1)
+
+    def create_positional_encoding(self):
+        pe = torch.zeros(self.board_size, self.board_size, self.dim_model)
+        pos_row = torch.arange(self.board_size).float().unsqueeze(1)
+        pos_col = torch.arange(self.board_size).float().unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.dim_model, 2).float() * (-math.log(10000.0) / self.dim_model)
+        )
+
+        pe_row = torch.zeros(self.board_size, self.dim_model)
+        pe_col = torch.zeros(self.board_size, self.dim_model)
+        pe_row[:, 0::2] = torch.sin(pos_row * div_term)
+        pe_row[:, 1::2] = torch.cos(pos_row * div_term)
+        pe_col[:, 0::2] = torch.sin(pos_col * div_term)
+        pe_col[:, 1::2] = torch.cos(pos_col * div_term)
+
+        for i in range(self.board_size):
+            for j in range(self.board_size):
+                pe[i, j] = pe_row[i] + pe_col[j]
+        return pe.view(-1, self.dim_model).unsqueeze(0)
+
+    def forward(self, x):
+        bsz = x.size(0)
+        x = x.permute(0, 3, 1, 2)
+        x = self.input_proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.pos_encoding
+        x = self.transformer(x)
+        x = x.transpose(1, 2).view(bsz, self.dim_model, self.board_size, self.board_size)
+
+        px = self.policy_conv(x)
+        px = self.policy_flatten(px)
+        policy_logits = self.policy_dense(px)
+
+        vx = self.value_conv(x)
+        vx = self.value_flatten(vx)
+        value = torch.tanh(self.value_dense(vx))
+        return policy_logits, value
+
+
+def build_model(args):
+    ensure_model_args(args)
+    if args.network == "resnet":
+        return ResNetModel(args)
+    if args.network == "transformer":
+        return TransformerModel(args)
+    raise ValueError(f"Unknown network architecture: {args.network}")
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
 class Agent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def __init__(self, args):
-
-        class TransformerModel(nn.Module):
-            def __init__(self, args):
-                super(TransformerModel, self).__init__()
-                self.board_size       = ChessGame.N        # 8
-                self.initial_channels = 119
-                self.dim_model        = 512               # ↑ was 512
-                self.num_actions      = ChessGame.ACTIONS  # 4672
-                self.num_layers       = 6                 # ↑ was 6
-                self.num_heads        = 8 # ↑ was 8
-                self.ff_multiplier    = 2
-
-                # --- Input projection ---
-                self.input_proj = nn.Conv2d(
-                    self.initial_channels, self.dim_model, kernel_size=1
-                )
-
-                # --- 2D Positional Encoding ---
-                self.register_buffer("pos_encoding", self.create_positional_encoding())
-
-                # --- Transformer stack ---
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=self.dim_model,
-                    nhead=self.num_heads,
-                    dim_feedforward=self.dim_model * self.ff_multiplier,
-                    dropout=0.1,
-                    batch_first=True
-                )
-                self.transformer = nn.TransformerEncoder(
-                    encoder_layer,
-                    num_layers=self.num_layers
-                )
-
-                # --- Policy head (same pattern as before) ---
-                self.policy_conv    = nn.Conv2d(self.dim_model, 2, kernel_size=3, padding=1)
-                self.policy_flatten = nn.Flatten()
-                self.policy_dense   = nn.Linear(2 * self.board_size * self.board_size,
-                                                self.num_actions)
-
-                # --- Value head (same pattern as before) ---
-                self.value_conv     = nn.Conv2d(self.dim_model, 1, kernel_size=3, padding=1)
-                self.value_flatten  = nn.Flatten()
-                self.value_dense    = nn.Linear(self.board_size * self.board_size, 1)
-
-            def create_positional_encoding(self):
-                # Build a [8,8,dim_model] grid of 2D sine/cosine, then flatten to [1,64,dim_model]
-                pe = torch.zeros(self.board_size, self.board_size, self.dim_model)
-                pos_row = torch.arange(self.board_size).float().unsqueeze(1)
-                pos_col = torch.arange(self.board_size).float().unsqueeze(1)
-                div_term = torch.exp(
-                    torch.arange(0, self.dim_model, 2).float() *
-                    (-math.log(10000.0) / self.dim_model)
-                )
-
-                pe_row = torch.zeros(self.board_size, self.dim_model)
-                pe_col = torch.zeros(self.board_size, self.dim_model)
-                pe_row[:, 0::2] = torch.sin(pos_row * div_term)
-                pe_row[:, 1::2] = torch.cos(pos_row * div_term)
-                pe_col[:, 0::2] = torch.sin(pos_col * div_term)
-                pe_col[:, 1::2] = torch.cos(pos_col * div_term)
-
-                for i in range(self.board_size):
-                    for j in range(self.board_size):
-                        pe[i, j] = pe_row[i] + pe_col[j]
-
-                # flatten to [64, dim_model], then unsqueeze batch: [1,64,dim_model]
-                pe = pe.view(-1, self.dim_model).unsqueeze(0)
-                return pe
-
-            def forward(self, x):
-                # x: [B, 8,8,119]
-                bsz = x.size(0)
-
-                # --- Input projection ---
-                x = x.permute(0, 3, 1, 2)            # [B, 119,8,8]
-                x = self.input_proj(x)              # [B,1024,8,8]
-
-                # --- Prepare for Transformer ---
-                x = x.flatten(2).transpose(1, 2)     # [B, 64, 1024]
-                x = x + self.pos_encoding            # [B, 64, 1024]
-                x = self.transformer(x)              # [B, 64, 1024]
-
-                # --- Back to grid ---
-                x = x.transpose(1, 2).view(bsz,
-                                           self.dim_model,
-                                           self.board_size,
-                                           self.board_size)  # [B,1024,8,8]
-
-                # --- Policy Head ---
-                px = self.policy_conv(x)             # [B,2,8,8]
-                px = self.policy_flatten(px)         # [B, 128]
-                policy = F.softmax(self.policy_dense(px), dim=-1)  # [B,4672]
-
-                # --- Value Head ---
-                vx = self.value_conv(x)              # [B,1,8,8]
-                vx = self.value_flatten(vx)          # [B, 64]
-                value = torch.tanh(self.value_dense(vx))           # [B,1]
-
-                return policy, value
-
-
-        self._model = TransformerModel(args).to(self.device)
+        ensure_model_args(args)
+        self.args = args
+        self.model_config = model_config_from_args(args)
+        self._model = build_model(args).to(self.device)
+        print(f"Network: {args.network}")
         print(f"Model parameters: {sum(p.numel() for p in self._model.parameters())}")
-        self.optimizer = torch.optim.AdamW(self._model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        self.optimizer = torch.optim.AdamW(
+            self._model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
 
     @classmethod
     def load(cls, path: str, args) -> "Agent":
+        ensure_model_args(args)
+        checkpoint = torch.load(path, map_location="cpu")
+        optimizer_state = None
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+            optimizer_state = checkpoint.get("optimizer_state_dict")
+            apply_model_config(args, checkpoint.get("model_config", {}))
+        else:
+            state_dict = checkpoint
+            if isinstance(state_dict, dict):
+                args.network = infer_network_from_state_dict(state_dict)
+            ensure_model_args(args)
+
         agent = Agent(args)
-        agent._model.load_state_dict(torch.load(path, map_location=agent.device))
+        agent._model.load_state_dict(state_dict)
+        if optimizer_state is not None:
+            agent.optimizer.load_state_dict(optimizer_state)
+            move_optimizer_state_to_device(agent.optimizer, agent.device)
         return agent
 
     def save(self, path: str) -> None:
-        torch.save(self._model.state_dict(), path)
+        torch.save({
+            "state_dict": self._model.state_dict(),
+            "model_config": self.model_config,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }, path)
 
-    def train(self, boards: torch.Tensor, target_policies: torch.Tensor, target_values: torch.Tensor) -> None:
+    def train(self, boards: torch.Tensor, target_policies: torch.Tensor, target_values: torch.Tensor) -> dict[str, float]:
         self._model.train()
         boards = boards.to(self.device)
         target_policies = target_policies.to(self.device)
-        target_values = target_values.to(self.device)
-        
-        policy, value = self._model(boards)
+        target_values = target_values.to(self.device).view(-1)
+
+        policy_logits, value = self._model(boards)
         value = value.squeeze(-1)
-        loss_policy = -torch.sum(target_policies * torch.log(policy + 1e-8), dim=1).mean()
+        log_policy = F.log_softmax(policy_logits, dim=1)
+        policy = log_policy.exp()
+        loss_policy = -torch.sum(target_policies * log_policy, dim=1).mean()
         loss_value = F.mse_loss(value, target_values)
         loss = loss_policy + loss_value
-        
-        self.optimizer.zero_grad()
+
+        metrics = {
+            "loss": float(loss.detach().item()),
+            "policy_loss": float(loss_policy.detach().item()),
+            "value_loss": float(loss_value.detach().item()),
+            "policy_entropy": float((-policy * log_policy).sum(dim=1).mean().detach().item()),
+            "target_policy_entropy": float((-target_policies * torch.log(target_policies + 1e-8)).sum(dim=1).mean().detach().item()),
+            "value_mean": float(value.detach().mean().item()),
+            "target_value_mean": float(target_values.detach().mean().item()),
+            "target_value_abs_mean": float(target_values.detach().abs().mean().item()),
+            "target_value_nonzero_fraction": float((target_values.detach() != 0).float().mean().item()),
+        }
+
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        grad_norm_sq = 0.0
+        for parameter in self._model.parameters():
+            if parameter.grad is not None:
+                grad_norm_sq += parameter.grad.detach().data.norm(2).item() ** 2
+        metrics["grad_norm"] = grad_norm_sq ** 0.5
         self.optimizer.step()
+        return metrics
 
     def predict(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if type(boards) is not torch.Tensor: 
+        if type(boards) is not torch.Tensor:
             boards = torch.from_numpy(boards).float()
         boards = boards.to(self.device)
         self._model.eval()
         with torch.no_grad():
-            policy, value = self._model(boards)
+            policy_logits, value = self._model(boards)
+            policy = F.softmax(policy_logits, dim=1)
         return policy.detach().cpu().numpy(), value.detach().cpu().numpy()
 
     def board(self, game) -> torch.Tensor:
-        #if game.to_play != 0:
-        #    game = game.clone(swap_players=True)
         return game.board
 
 
