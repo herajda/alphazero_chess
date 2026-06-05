@@ -104,6 +104,10 @@ bool MCTNode::is_expanded() const {
 }
 
 void MCTNode::expand() {
+    expand(BatchManager::instance());
+}
+
+void MCTNode::expand(BatchManager& manager) {
     if (auto win = game_.winner()) {
         children_.clear();
         float v = terminal_value_for_side_to_move(win.value(), game_.to_play());
@@ -114,8 +118,7 @@ void MCTNode::expand() {
 
     auto tensor = game_.encodeTensor();
     std::vector<float> flat(tensor.begin(), tensor.end());
-    auto [policy, v] = BatchManager::instance()
-                          .enqueue(flat).get();
+    auto [policy, v] = manager.enqueue(flat).get();
 
     auto legal = game_.legalMoves();
     auto priors = sanitise_priors(policy, legal);
@@ -245,8 +248,13 @@ float MCTNode::total_value() const {
 
 std::vector<float> run_mcts(const ChessGame &root_game, const MCTArgs &args)
 {
+    return run_mcts(root_game, args, BatchManager::instance());
+}
+
+std::vector<float> run_mcts(const ChessGame &root_game, const MCTArgs &args, BatchManager& manager)
+{
     MCTNode root(1.0f, root_game);
-    root.expand();
+    root.expand(manager);
     root.add_exploration_noise(args.epsilon, args.alpha);
 
 
@@ -264,7 +272,7 @@ std::vector<float> run_mcts(const ChessGame &root_game, const MCTArgs &args)
         
         bool expanded_now = false;
         if (!node->is_expanded()) {
-            node->expand();
+            node->expand(manager);
             expanded_now = true;
         }
 

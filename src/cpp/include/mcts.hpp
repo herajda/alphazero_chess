@@ -8,6 +8,8 @@
 
 namespace az73 {
 
+class BatchManager;
+
 // Total number of possible actions: 8x8x73
 constexpr int ACTION_SPACE = 8 * 8 * 73;
 
@@ -34,6 +36,7 @@ public:
     [[nodiscard]] float value() const;
     [[nodiscard]] bool is_expanded() const;
     void expand();
+    void expand(BatchManager& manager);
     void add_exploration_noise(double epsilon, double alpha);
     [[nodiscard]] std::pair<uint16_t, MCTNode*> select_child();
     void update(float v);
@@ -62,7 +65,8 @@ private:
     bool pending_{false};
 };
 
-// Run MCTS from `root_game` under parameters in `args`, return policy vector [4672]
+// Run MCTS from `root_game` under parameters in `args`, return policy vector [4672].
 std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args);
+std::vector<float> run_mcts(const ChessGame& root_game, const MCTArgs& args, BatchManager& manager);
 
 } // namespace az73

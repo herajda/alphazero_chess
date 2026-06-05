@@ -18,7 +18,15 @@ std::uint16_t encode(const chess::Board &board, const chess::Move &mv) {
     using namespace chess;
     const Color toPlay = board.sideToMove();
     const Square trueFrom = mv.from();
-    const Square trueTo = mv.to();
+    Square trueTo = mv.to();
+    if (mv.typeOf() == chess::Move::CASTLING) {
+        const int rook_file = trueTo.file();
+        const int king_file = trueFrom.file();
+        const int king_dest_file = rook_file > king_file ? 6 : 2;
+        trueTo = Square(
+            File(static_cast<File::underlying>(king_dest_file)),
+            trueFrom.rank());
+    }
     const Square fromSq = trueFrom.relative_square(toPlay);
     const Square toSq = trueTo.relative_square(toPlay);
     const int file = fromSq.file();
@@ -102,6 +110,13 @@ chess::Move decode_action(std::uint16_t action, const chess::Board &board) {
     }
     const chess::Piece fromPiece = board.at(from);
     const chess::Piece toPiece = to.is_valid() ? board.at(to) : chess::Piece::NONE;
+    if (fromPiece.type() == chess::PieceType::KING && std::abs(int(to.file()) - int(from.file())) == 2) {
+        const int rook_file = to.file() > from.file() ? 7 : 0;
+        chess::Square rook(
+            chess::File(static_cast<chess::File::underlying>(rook_file)),
+            from.rank());
+        return chess::Move::make<chess::Move::CASTLING>(from, rook);
+    }
     if (fromPiece.type() == chess::PieceType::KING && toPiece != chess::Piece::NONE && toPiece.color() == fromPiece.color() && toPiece.type() == chess::PieceType::ROOK) {
         return chess::Move::make<chess::Move::CASTLING>(from, to);
     }
@@ -274,16 +289,31 @@ std::vector<std::uint16_t> ChessGame::legalMoves() const {
 }
 
 std::optional<int> ChessGame::winner() const {
-    const auto &b = currentBoard();
+    const auto b = currentBoard();
     using namespace chess;
-    if (b.isHalfMoveDraw()) return -1;
-    if (b.isRepetition()) return -1;
-    Movelist movelist;
-    movegen::legalmoves<movegen::MoveGenType::ALL>(movelist, b, PieceGenType::PAWN | PieceGenType::KNIGHT | PieceGenType::BISHOP | PieceGenType::ROOK | PieceGenType::QUEEN | PieceGenType::KING);
-    if (movelist.empty()) {
-        if (b.inCheck()) return (b.sideToMove() == Color::WHITE) ? 0 : 1;
-        else return -1;
+
+    const auto game_over = b.isGameOver();
+    const auto result = game_over.second;
+    if (result == GameResult::DRAW) {
+        return -1;
     }
+    if (result == GameResult::LOSE) {
+        return (b.sideToMove() == Color::WHITE) ? 0 : 1;
+    }
+    if (result == GameResult::WIN) {
+        return (b.sideToMove() == Color::WHITE) ? 1 : 0;
+    }
+
+    if (!hashes_.empty()) {
+        const auto current_hash = hashes_.back();
+        int repetitions = 0;
+        for (auto hash : hashes_) {
+            if (hash == current_hash && ++repetitions >= 3) {
+                return -1;
+            }
+        }
+    }
+
     return std::nullopt;
 }
 

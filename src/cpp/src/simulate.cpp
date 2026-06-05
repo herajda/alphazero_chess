@@ -16,6 +16,8 @@
 #include <atomic>
 #include <csignal> // <-- add this
 #include <numeric>
+#include <cstdio>
+#include <algorithm>
 
 namespace az73 {
 
@@ -25,7 +27,7 @@ std::atomic<bool> interrupted{false};
 // Signal handler
 void handle_sigint(int) {
     interrupted = true;
-    std::cerr << "[AZ] Caught SIGINT, stopping simulation..." << std::endl;
+    std::fprintf(stderr, "[AZ] Caught SIGINT, stopping simulation...\n");
 }
 // --------------------------------------------------------------------
 // Evaluate vs STOCKFISH (UCI) -- threaded & batched
@@ -112,6 +114,40 @@ struct UciEngine {
         
         // *** should never happen, but be defensive ***
         return legal.empty() ? Move::NULL_MOVE : legal[0];
+    }
+
+    static void apply_random_opening(ChessGame &game,
+                                     int max_random_plies,
+                                     std::mt19937_64 &rng)
+    {
+        const int opening_limit = std::max(0, max_random_plies);
+        if (opening_limit <= 0) return;
+
+        std::uniform_int_distribution<int> plies_dist(0, opening_limit);
+        const int opening_plies = plies_dist(rng);
+        for (int ply = 0; ply < opening_plies && !game.winner().has_value(); ++ply) {
+            auto legal = game.legalMoves();
+            if (legal.empty()) break;
+            std::uniform_int_distribution<size_t> u(0, legal.size() - 1);
+            game.makeMove(legal[u(rng)]);
+        }
+    }
+
+    static uint16_t select_best_mcts_action(ChessGame &game,
+                                            const MCTArgs &args,
+                                            BatchManager &manager)
+    {
+        auto policy = run_mcts(game, args, manager);
+        auto legal = game.legalMoves();
+        uint16_t best = legal.front();
+        float best_p = policy[best];
+        for (auto a : legal) {
+            if (policy[a] > best_p) {
+                best_p = policy[a];
+                best = a;
+            }
+        }
+        return best;
     }
 // public API
 std::tuple<int,int,int,int,int,int>
@@ -284,6 +320,76 @@ evaluate_vs_random(
 }
 
 // --------------------------------------------------------------------
+// Evaluate candidate model vs current best model for promotion gating
+// --------------------------------------------------------------------
+std::tuple<int,int,int,int,int,int>
+evaluate_model_vs_model(
+    const std::string &candidate_model_path,
+    const std::string &best_model_path,
+    int games_per_color,
+    int num_threads,
+    int num_simulations,
+    double alpha,
+    int opening_random_plies
+) {
+    constexpr std::size_t GPU_BATCH = 256;
+    BatchManager candidate_manager;
+    BatchManager best_manager;
+    candidate_manager.init(candidate_model_path, GPU_BATCH);
+    best_manager.init(best_model_path, GPU_BATCH);
+    py::gil_scoped_release no_gil;
+
+    std::atomic<int> cw_win{0}, cw_loss{0}, cw_draw{0};
+    std::atomic<int> cb_win{0}, cb_loss{0}, cb_draw{0};
+    std::atomic<int> game_idx{0};
+
+    auto worker = [&](int) {
+        std::mt19937_64 rng{std::random_device{}()};
+        MCTArgs mcts_args{num_simulations, alpha, 0.0, 0};
+
+        while (true) {
+            int idx = game_idx.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= 2 * games_per_color) break;
+
+            const bool candidate_is_white = idx < games_per_color;
+            ChessGame game;
+            apply_random_opening(game, opening_random_plies, rng);
+
+            while (!game.winner().has_value()) {
+                const bool white_to_move = game.to_play() == 1;
+                const bool candidate_turn = white_to_move == candidate_is_white;
+                BatchManager &manager = candidate_turn ? candidate_manager : best_manager;
+                game.makeMove(select_best_mcts_action(game, mcts_args, manager));
+            }
+
+            const int outcome = *game.winner();
+            const bool draw = outcome == -1;
+            const bool candidate_won = !draw && ((outcome == 1) == candidate_is_white);
+
+            if (candidate_is_white) {
+                if (draw) cw_draw++;
+                else if (candidate_won) cw_win++;
+                else cw_loss++;
+            } else {
+                if (draw) cb_draw++;
+                else if (candidate_won) cb_win++;
+                else cb_loss++;
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int t = 0; t < num_threads; ++t) threads.emplace_back(worker, t);
+    for (auto &th : threads) th.join();
+
+    return {
+        cw_win.load(), cw_loss.load(), cw_draw.load(),
+        cb_win.load(), cb_loss.load(), cb_draw.load()
+    };
+}
+
+// --------------------------------------------------------------------
 // Number of floats per record: state (8x8x119) + policy (8x8x73) + z
 static constexpr uint64_t RECORD_FLOATS = 8ULL * 8 * 119 + 8ULL * 8 * 73 + 1;
 static constexpr uint64_t RECORD_BYTES = RECORD_FLOATS * sizeof(float);
@@ -312,7 +418,9 @@ void simulate_games_buffered(
     double epsilon,
     int sampling_moves,
     const std::string &filename,
-    int64_t capacity
+    int64_t capacity,
+    int opening_random_plies,
+    int inference_batch_size
 ) {
     // Install signal handler (only once, safe for repeated calls)
     static std::once_flag sig_flag;
@@ -323,14 +431,15 @@ void simulate_games_buffered(
 
 
     // 1) Load model
-    BatchManager::instance().init(model_path, 64);
+    const std::size_t gpu_batch = static_cast<std::size_t>(std::max(1, inference_batch_size));
+    BatchManager::instance().init(model_path, gpu_batch);
 
     py::gil_scoped_release no_gil;
 
     // 2) Open (or create) ring-buffer file
     std::fstream f(filename, std::ios::in | std::ios::out | std::ios::binary);
     if (!f) {
-        std::cerr << "[AZ] creating new buffer file\n";
+        std::fprintf(stderr, "[AZ] creating new buffer file\n");
         std::ofstream of(filename, std::ios::binary | std::ios::trunc);
         int64_t zero = 0;
         of.write(reinterpret_cast<const char*>(&capacity), sizeof(capacity));
@@ -340,12 +449,12 @@ void simulate_games_buffered(
         std::filesystem::resize_file(filename, HEADER_BYTES + capacity * RECORD_BYTES);
         f.open(filename, std::ios::in | std::ios::out | std::ios::binary);
     }
-    std::cerr << "[AZ] buffer file opened\n";
+    std::fprintf(stderr, "[AZ] buffer file opened\n");
 
     // 3) Read header
     int64_t size = read_i64(f, 8);
     int64_t head = read_i64(f, 16);
-    std::cerr << "[AZ] initial size=" << size << " head=" << head << "\n";
+    std::fprintf(stderr, "[AZ] initial size=%lld head=%lld\n", static_cast<long long>(size), static_cast<long long>(head));
 
     std::mutex file_mtx;
     auto append_one = [&](const std::vector<float> &state, const std::vector<float> &policy, float z) {
@@ -361,7 +470,6 @@ void simulate_games_buffered(
         if (size < capacity) ++size;
         write_i64(f, 8, size);
         write_i64(f, 16, head);
-        std::cerr << "[AZ] new size=" << size << " new head=" << head << "\n";
     };
 
     // --- dynamic, perfectly-balanced scheduling --------------------
@@ -391,6 +499,8 @@ void simulate_games_buffered(
                 std::vector<float> toplays;
 
                 ChessGame game;
+                apply_random_opening(game, opening_random_plies, rng);
+
                 MCTArgs args{ num_simulations, alpha, epsilon, sampling_moves };
                 while (!game.winner().has_value()) {
                     // Check for interruption inside game loop
@@ -399,8 +509,8 @@ void simulate_games_buffered(
 
                     std::vector<float> flat;
                     flat.reserve(raw.size());
-                    for (uint16_t b : raw)
-                        flat.push_back(static_cast<float>(b));      // 0.f / 1.f
+                    for (float value : raw)
+                        flat.push_back(value);
 
                     auto policy = run_mcts(game, args);
                     //std::cout << "[AZ] policy size = " << policy.size() << std::endl;
@@ -450,7 +560,7 @@ void simulate_games_buffered(
     }
     for (auto &th : threads) th.join();
     f.close();
-    std::cerr << "[AZ] simulate_games_buffered DONE\n";
+    std::fprintf(stderr, "[AZ] simulate_games_buffered DONE\n");
 
     // If interrupted, raise Python KeyboardInterrupt
     if (interrupted) {
@@ -465,7 +575,7 @@ using az73::BatchManager;
 using az73::MCTArgs;
 using az73::run_mcts;
 
-PYBIND11_MODULE(chess_engine, m) {
+PYBIND11_MODULE(_chess_engine, m) {
     m.doc() = "C++ self-play with batched inference and on-disk ring buffer";
     m.def("simulate_games_buffered", &az73::simulate_games_buffered,
         py::arg("model_path"),
@@ -476,7 +586,9 @@ PYBIND11_MODULE(chess_engine, m) {
         py::arg("epsilon"),
         py::arg("sampling_moves"),
         py::arg("filename"),
-        py::arg("replay_buffer_capacity"));
+        py::arg("replay_buffer_capacity"),
+        py::arg("opening_random_plies") = 0,
+        py::arg("inference_batch_size") = 64);
     
     m.def("evaluate_vs_random", &az73::evaluate_vs_random,
           py::arg("model_path"),
@@ -488,6 +600,17 @@ PYBIND11_MODULE(chess_engine, m) {
           py::arg("sampling_moves"),
           "Evaluate the AlphaZero agent vs a random agent, returning "
           "(white_wins, white_losses, white_draws, black_wins, black_losses, black_draws).");
+    m.def("evaluate_model_vs_model", &az73::evaluate_model_vs_model,
+          py::arg("candidate_model_path"),
+          py::arg("best_model_path"),
+          py::arg("games_per_color"),
+          py::arg("num_threads"),
+          py::arg("num_simulations"),
+          py::arg("alpha"),
+          py::arg("opening_random_plies") = 0,
+          "Evaluate candidate model against current best, returning "
+          "(candidate_white_wins, candidate_white_losses, candidate_white_draws, "
+          "candidate_black_wins, candidate_black_losses, candidate_black_draws).");
     m.def("legal_actions",
         [](const std::string &fen) {
             ChessGame game(fen);
@@ -535,6 +658,24 @@ PYBIND11_MODULE(chess_engine, m) {
         py::arg("parent_visit_count"),
         py::arg("child_visit_count"),
         "Return the PUCT score using child value from the child perspective.");
+    m.def("terminal_value_after_uci",
+        [](const std::vector<std::string> &moves) -> py::object {
+            ChessGame game;
+            for (const auto &uci : moves) {
+                auto board = game.currentBoard();
+                auto move = chess::uci::uciToMove(board, uci);
+                game.makeMove(move);
+            }
+            auto winner = game.winner();
+            if (!winner.has_value()) {
+                return py::none();
+            }
+            return py::float_(az73::terminal_value_for_side_to_move(
+                winner.value(),
+                game.to_play()));
+        },
+        py::arg("moves"),
+        "Return terminal value after replaying UCI moves from the initial position.");
     m.def("select_move",
         // Lambda takes: path to TorchScript, FEN, MCTS params → returns best flat action
         [](const std::string &model_path,

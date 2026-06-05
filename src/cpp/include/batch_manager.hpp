@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <future>
 #include <memory>
+#include <string>
 #include <torch/script.h>
 
 namespace az73 {
@@ -18,22 +19,24 @@ struct EvalRequest {
 
 class __attribute__((visibility("hidden"))) BatchManager {
 public:
-    // Get the singleton instance
+    // Get the singleton instance used by legacy single-model call sites.
     static BatchManager& instance();
 
-    // Initialize with the path to a TorchScript module and batch size
+    BatchManager() = default;
+    ~BatchManager();
+    BatchManager(const BatchManager&) = delete;
+    BatchManager& operator=(const BatchManager&) = delete;
+
+    // Initialize with the path to a TorchScript module and batch size.
     void init(const std::string& model_path, size_t batch_size);
 
-    // Enqueue a flat tensor, return a future for {policy, value}
+    // Enqueue a flat tensor, return a future for {policy, value}.
     std::future<std::pair<std::vector<float>, float>>
     enqueue(const std::vector<float>& flat_tensor);
     std::string current_path_;
 private:
-    BatchManager() = default;
-    ~BatchManager();
-
-    // Main loop that gathers requests and calls into Python
-    void run_loop();
+    // Main loop that gathers requests and runs batched TorchScript inference.
+    void run_loop(std::string model_path, std::shared_ptr<std::promise<void>> ready);
 
 
     std::mutex                               mtx_;

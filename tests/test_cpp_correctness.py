@@ -17,10 +17,10 @@ pytestmark = pytest.mark.skipif(
 
 if not MISSING_DEPS:
     import chess
-    import chess_engine
-    import chess_moves
     import numpy as np
     import torch
+    import chess_engine
+    import chess_moves
 else:
     chess = None
     chess_engine = None
@@ -85,6 +85,17 @@ def test_terminal_value_is_from_side_to_move_perspective() -> None:
     board.push(chess.Move.from_uci("g6g7"))
     assert board.is_checkmate()
     assert chess_engine.terminal_value(board.fen()) == pytest.approx(-1.0)
+
+
+def test_terminal_value_detects_insufficient_material() -> None:
+    assert chess_engine.terminal_value("8/8/8/8/8/8/8/K6k w - - 0 1") == pytest.approx(0.0)
+
+
+def test_terminal_value_detects_threefold_repetition_from_history() -> None:
+    assert chess_engine.terminal_value_after_uci([
+        "g1f3", "g8f6", "f3g1", "f6g8",
+        "g1f3", "g8f6", "f3g1", "f6g8",
+    ]) == pytest.approx(0.0)
 
 
 def test_puct_score_uses_parent_perspective_for_child_value() -> None:

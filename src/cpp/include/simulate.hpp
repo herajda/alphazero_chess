@@ -27,7 +27,9 @@ void simulate_games_buffered(
     double epsilon,
     int sampling_moves,
     const std::string &filename,
-    int64_t replay_buffer_capacity
+    int64_t replay_buffer_capacity,
+    int opening_random_plies,
+    int inference_batch_size
 );
 // add just below evaluate_vs_random declaration
 std::tuple<int,int,int,int,int,int>
@@ -41,6 +43,17 @@ evaluate_vs_stockfish(
     int num_simulations,               // our MCTS sims / move
     double alpha, double epsilon,
     int sampling_moves
+);
+
+std::tuple<int,int,int,int,int,int>
+evaluate_model_vs_model(
+    const std::string &candidate_model_path,
+    const std::string &best_model_path,
+    int games_per_color,
+    int num_threads,
+    int num_simulations,
+    double alpha,
+    int opening_random_plies
 );
 
 

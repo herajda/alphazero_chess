@@ -26,7 +26,7 @@ set(CMAKE_CXX_FLAGS_RELEASE
 set(TORCH_CUDA_ARCH_LIST "8.9")
 
 # Pull in Python & PyBind11 & Torch
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Torch REQUIRED)
 
@@ -48,10 +48,16 @@ add_library(chess_engine MODULE
 )
 
 target_link_libraries(chess_engine PRIVATE
-  pybind11::embed
-  ${Python3_LIBRARIES}
+  pybind11::module
   ${TORCH_LIBRARIES}
 )
+
+if(TORCH_CXX_FLAGS)
+  separate_arguments(TORCH_CXX_FLAGS_LIST UNIX_COMMAND "${TORCH_CXX_FLAGS}")
+  target_compile_options(chess_engine PRIVATE ${TORCH_CXX_FLAGS_LIST})
+endif()
+
+get_filename_component(TORCH_LIBRARY_DIR "${TORCH_LIBRARY}" DIRECTORY)
 
 # 6) Enable LTO/IPO on this target (requires CMake ≥3.9)
 include(CheckIPOSupported)
@@ -62,7 +68,10 @@ endif()
 
 # 7) Static‐link the C++ runtime if you really need it
 set_target_properties(chess_engine PROPERTIES
+  OUTPUT_NAME "_chess_engine"
   LINK_FLAGS "-static-libstdc++ -static-libgcc"
+  BUILD_RPATH "${TORCH_LIBRARY_DIR}"
+  INSTALL_RPATH "${TORCH_LIBRARY_DIR}"
   PREFIX ""
 )
 
